@@ -3,6 +3,7 @@ import json
 import numpy as np
 import pandas as pd
 import torch
+import os
 import gc
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import roc_auc_score
@@ -18,7 +19,7 @@ from data_loading import create_cot_dataset, create_dataset
 from utils import generate_with_hooks
 
 # %% Load the model
-model = ChatModel("google/gemma-2-9b-it", cache_dir=os.environ['HF_HOME'])
+model = ChatModel("google/gemma-2-9b-it", device='cuda', cache_dir=os.environ['HF_HOME'])
 print(f"Model loaded: {model.model_name}")
 print(f"Number of layers: {model.cfg.n_layers}")
 print(f"Model dimension: {model.cfg.d_model}")
@@ -33,24 +34,35 @@ print(f"Loaded {len(cot_dataset)} examples")
 train_size = 100
 train_dataset, test_dataset = train_test_split(cot_dataset, train_size=train_size, random_state=42)
 print(f"Train size: {len(train_dataset)}, Test size: {len(test_dataset)}")
+# %%
+print("\n".join([turn['content'] for turn in train_dataset[0]['prompt']]))
 
 # %% Function to extract residual activations
-def get_resid_activations(prompts, model):
-    """Extract residual activations from all layers for given prompts"""
+def get_resid_activations(prompts, model, batch_size=2):
+    """Extract residual activations from all layers for given prompts in batches"""
     layers = list(range(model.cfg.n_layers))
-    tokens = model.to_tokens(prompts, prepend_bos=True)
-    _, cache = model.run_with_cache(tokens, pos_slice=-1)
+    all_activations = []
     
-    activations = np.zeros((len(prompts), model.cfg.n_layers, model.cfg.d_model))
-    
-    for layer in layers:
-        layer_activations = cache["resid_post", layer]
-        layer_activations = layer_activations.squeeze().detach().cpu().numpy()
-        activations[:, layer, :] = layer_activations
-        del layer_activations
-        torch.cuda.empty_cache()
-        gc.collect()
-    
+    # Process prompts in batches
+    for i in range(0, len(prompts), batch_size):
+        batch_prompts = prompts[i:i + batch_size]
+        tokens = model.to_tokens(batch_prompts, prepend_bos=True)
+        _, cache = model.run_with_cache(tokens, pos_slice=-1)
+        
+        batch_activations = torch.zeros((len(batch_prompts), model.cfg.n_layers, model.cfg.d_model))
+        
+        for layer in layers:
+            layer_activations = cache["resid_post", layer]
+            layer_activations = layer_activations.squeeze().detach().cpu()
+            batch_activations[:, layer, :] = layer_activations
+            del layer_activations
+            torch.cuda.empty_cache()
+            gc.collect()
+            
+        all_activations.append(batch_activations)
+        
+    # Concatenate all batches
+    activations = np.concatenate(all_activations, axis=0)
     return activations
 
 # %% Function to generate model predictions
@@ -93,15 +105,52 @@ def generate_predictions(prompts, model, temperature=0.7, max_new_tokens=100):
     
     return predictions
 
-# %% Process training data
+# %%
+def format_prompt(model, prompt):
+    prompt_replaced = []
+    last_msg = None
+    for msg in prompt:
+        if msg['role'] == 'model':
+            msg['role'] = 'assistant'
+        if last_msg and last_msg['role'] == msg['role']:
+            last_msg['content'] += "\n" + msg['content']
+        elif not last_msg:
+            last_msg = msg
+        else:
+            prompt_replaced.append(last_msg)
+            last_msg = msg
+    prompt_replaced.append(last_msg)
+    return model.apply_chat_template(prompt_replaced)
+# %%
 print("Processing training data...")
 train_prompts = [item['prompt'] for item in train_dataset]
+train_prompts = [format_prompt(model, prompt) for prompt in train_prompts]
 
+# %%
+batch_prompts = train_prompts[6:8]
+tokens = model.to_tokens(batch_prompts, prepend_bos=True)
+_, cache = model.run_with_cache(tokens, pos_slice=-1)
+del _, cache, batch_prompts, tokens
+torch.cuda.empty_cache()
+gc.collect()
+
+# %%
+batch_activations = torch.zeros((len(batch_prompts), model.cfg.n_layers, model.cfg.d_model))
+
+layers = list(range(model.cfg.n_layers))
+for layer in layers:
+    layer_activations = cache["resid_post", layer]
+    layer_activations = layer_activations.squeeze().detach().cpu()
+    batch_activations[:, layer, :] = layer_activations
+    del layer_activations
+    torch.cuda.empty_cache()
+    gc.collect()
+# %%
 # Get activations
 print("Extracting activations...")
 train_activations = get_resid_activations(train_prompts, model)
 print(f"Train activations shape: {train_activations.shape}")
-
+# %%
 # Generate predictions
 print("Generating predictions...")
 train_predictions = generate_predictions(train_prompts, model)
