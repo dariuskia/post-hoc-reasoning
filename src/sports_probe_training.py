@@ -4,7 +4,9 @@ import numpy as np
 import pandas as pd
 import torch
 import os
+import re
 import gc
+from copy import deepcopy
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import train_test_split
@@ -18,18 +20,23 @@ from models import ChatModel
 from data_loading import create_cot_dataset, create_dataset
 from utils import generate_with_hooks
 
+THINKING = True
 # %% Load the model
-model = ChatModel("google/gemma-2-9b-it", device='cuda', cache_dir=os.environ['HF_HOME'])
+model = ChatModel("google/gemma-2-9b-it", device='cuda', n_devices=2, cache_dir=os.environ['HF_HOME'])
 print(f"Model loaded: {model.model_name}")
 print(f"Number of layers: {model.cfg.n_layers}")
 print(f"Model dimension: {model.cfg.d_model}")
 
+# %%
+import importlib
+importlib.reload(data_loading)
+from data_loading import create_cot_dataset, create_dataset
 # %% Load sports understanding dataset
 print("Loading sports understanding dataset...")
 examples = create_dataset("sports_understanding")
-cot_dataset = create_cot_dataset("sports_understanding", examples)
+cot_dataset = create_cot_dataset("sports_understanding", examples, thinking=THINKING)
 print(f"Loaded {len(cot_dataset)} examples")
-
+# %%
 # Split into train and test
 train_size = 100
 train_dataset, test_dataset = train_test_split(cot_dataset, train_size=train_size, random_state=42)
@@ -38,7 +45,7 @@ print(f"Train size: {len(train_dataset)}, Test size: {len(test_dataset)}")
 print("\n".join([turn['content'] for turn in train_dataset[0]['prompt']]))
 
 # %% Function to extract residual activations
-def get_resid_activations(prompts, model, batch_size=2):
+def get_resid_activations(prompts, model, batch_size=1):
     """Extract residual activations from all layers for given prompts in batches"""
     layers = list(range(model.cfg.n_layers))
     all_activations = []
@@ -61,129 +68,182 @@ def get_resid_activations(prompts, model, batch_size=2):
             
         all_activations.append(batch_activations)
         
+        # Clear cache after each batch to save memory
+        del cache, tokens
+        torch.cuda.empty_cache()
+        gc.collect()
+        
     # Concatenate all batches
     activations = np.concatenate(all_activations, axis=0)
     return activations
 
-# %% Function to generate model predictions
-def generate_predictions(prompts, model, temperature=0.7, max_new_tokens=100):
-    """Generate predictions for given prompts"""
-    tokens = model.to_tokens(prompts, prepend_bos=True)
-    generations = model.generate(
-        tokens, 
-        max_new_tokens=max_new_tokens, 
-        temperature=temperature,
-        do_sample=True
-    )
-    
-    # Parse responses to extract predictions
-    predictions = []
-    for i, (prompt, generation) in enumerate(zip(prompts, generations)):
-        response = generation[len(prompt):]
-        # Simple parsing - look for (A) or (B) in the response
-        if "(A)" in response:
-            pred_letter = "A"
-        elif "(B)" in response:
-            pred_letter = "B"
-        else:
-            pred_letter = "Unknown"
-        
-        # Map to yes/no based on the prompt structure
-        if "(A) Yes" in prompt or "(A) No" in prompt:
-            pred_answer = "yes" if pred_letter == "A" else "no"
-        else:
-            pred_answer = "no" if pred_letter == "A" else "yes"
-        
-        predictions.append({
-            'prompt': prompt,
-            'response': response,
-            'pred_letter': pred_letter,
-            'pred_answer': pred_answer,
-            'correct_letter': train_dataset[i]['correct_letter'],
-            'correct_answer': train_dataset[i]['correct_answer']
-        })
-    
-    return predictions
 
+# %%
+# Helper functions
+def parse_response(response: str, thinking: bool = True) -> Tuple[str, str]:
+    # TODO: Make more robust; this only works for gemma
+    response = (
+        response.strip()
+        .replace("<eos>", "")
+        .replace("<pad>", "")
+        .replace("<end_of_turn>", "")
+        .strip()
+    )
+    if thinking:
+        start_answer_string = "the best answer is:"
+        if start_answer_string not in response.lower():
+            return "", ""
+        answer_part = response.split(start_answer_string)[-1]
+        letter_match = re.search(r"\((.)\)", answer_part)
+        if not letter_match:
+            return "", ""
+        letter = letter_match.group(1)
+        text_answer = (
+            answer_part.split(")")[-1]
+            .strip()
+            .split(", ")[0]
+            .lower()
+            .replace(".", "")
+            .strip()
+        )
+    else:
+        letter = "A" if "(A)" in response else "B"
+        text_answer = "yes" if "yes" in response.lower() else "no"
+    return letter, text_answer
 # %%
 def format_prompt(model, prompt):
     prompt_replaced = []
     last_msg = None
     for msg in prompt:
-        if msg['role'] == 'model':
-            msg['role'] = 'assistant'
-        if last_msg and last_msg['role'] == msg['role']:
+        if last_msg is None:
+            last_msg = deepcopy(msg)
+            continue
+        if last_msg['role'] == msg['role']:
             last_msg['content'] += "\n" + msg['content']
-        elif not last_msg:
-            last_msg = msg
         else:
             prompt_replaced.append(last_msg)
-            last_msg = msg
+            last_msg = deepcopy(msg)
     prompt_replaced.append(last_msg)
     return model.apply_chat_template(prompt_replaced)
-# %%
-print("Processing training data...")
-train_prompts = [item['prompt'] for item in train_dataset]
-train_prompts = [format_prompt(model, prompt) for prompt in train_prompts]
+# %% Function to generate model predictions
+def generate_predictions(dataset, model, temperature=0.7, max_new_tokens=100):
+    """Generate predictions for given prompts"""
+    prompts = [format_prompt(model, item['prompt']) for item in dataset]
+    predictions = []
+    
+    # Process one prompt at a time to minimize memory usage
+    for i, prompt in enumerate(prompts):
+        # Generate tokens and prediction for single prompt
+        tokens = model.to_tokens([prompt], prepend_bos=True)
+        generation = model.generate(
+            tokens[:, :-2],
+            max_new_tokens=max_new_tokens,
+            temperature=temperature, 
+            do_sample=True
+        )
+        
+        # Extract response
+        response = model.tokenizer.decode(generation[0][tokens.shape[1]-2:])
+        letter, text_answer = parse_response(response, thinking=THINKING)
+        print(f"Response {i}: {response}")
+        
+        predictions.append({
+            'prompt': prompt,
+            'response': response,
+            'pred_letter': letter,
+            'pred_answer': text_answer,
+            'correct_letter': dataset[i]['correct_letter'],
+            'correct_answer': dataset[i]['correct_answer']
+        })
+        
+        # Clean up tensors
+        del tokens, generation
+        torch.cuda.empty_cache()
+        gc.collect()
+        
+    return predictions
 
 # %%
-batch_prompts = train_prompts[6:8]
-tokens = model.to_tokens(batch_prompts, prepend_bos=True)
-_, cache = model.run_with_cache(tokens, pos_slice=-1)
-del _, cache, batch_prompts, tokens
+# Clear memory before processing
 torch.cuda.empty_cache()
 gc.collect()
-
 # %%
-batch_activations = torch.zeros((len(batch_prompts), model.cfg.n_layers, model.cfg.d_model))
+# Generate predictions first (needed for probe training)
+print("Generating predictions...")
+train_predictions = generate_predictions(train_dataset, model)
+print(f"Generated predictions for {len(train_predictions)} examples")
+# Save predictions to file
+print("Saving predictions...")
+torch.save(train_predictions, f"train_predictions_{'cot' if THINKING else 'noncot'}.pt")
+# %%
+letter_accuracy = np.mean([pred['pred_letter'] == pred['correct_letter'] for pred in train_predictions])
+answer_accuracy = np.mean([pred['pred_answer'] == pred['correct_answer'] for pred in train_predictions])
+print(f"Letter Accuracy: {letter_accuracy:.2%}")
+print(f"Answer Accuracy: {answer_accuracy:.2%}")
+# %%
+# Generate test predictions
+print("Generating predictions...")
+test_predictions = generate_predictions(test_dataset, model)
+print(f"Generated predictions for {len(test_predictions)} examples")
+# Save predictions to file
+print("Saving predictions...")
+torch.save(test_predictions, f"test_predictions_{'cot' if THINKING else 'noncot'}.pt")
+# %%
+letter_accuracy = np.mean([pred['pred_letter'] == pred['correct_letter'] for pred in test_predictions])
+answer_accuracy = np.mean([pred['pred_answer'] == pred['correct_answer'] for pred in test_predictions])
+print(f"Letter Accuracy: {letter_accuracy:.2%}")
+print(f"Answer Accuracy: {answer_accuracy:.2%}")
 
-layers = list(range(model.cfg.n_layers))
-for layer in layers:
-    layer_activations = cache["resid_post", layer]
-    layer_activations = layer_activations.squeeze().detach().cpu()
-    batch_activations[:, layer, :] = layer_activations
+# %% Function to extract activations for a single layer (memory efficient)
+@torch.inference_mode()
+def get_layer_activations(prompts, model, layer, batch_size=1):
+    """Extract activations for a single layer to save memory"""
+    all_activations = []
+    
+    # Process prompts in batches
+    for i in range(0, len(prompts), batch_size):
+        batch_prompts = prompts[i:i + batch_size]
+        tokens = model.to_tokens(batch_prompts, prepend_bos=True)
+        _, cache = model.run_with_cache(tokens, pos_slice=-1)
+        
+        # Extract only the specified layer
+        layer_activations = cache["resid_post", layer]
+        layer_activations = layer_activations.squeeze().detach().cpu()
+        all_activations.append(layer_activations)
+        
+        # Clear cache immediately
+        del cache, tokens, layer_activations
+        torch.cuda.empty_cache()
+        gc.collect()
+        
+    # Concatenate all batches
+    activations = torch.stack(all_activations, dim=0)
+    print(f"{activations.shape=}")
+    return activations
+    
+def prepare_probe_data_layer(results, dataset, model, layer, batch_size=1):
+    """Prepare data for training a probe on a specific layer - memory efficient"""
+    data = []
+    prompts = [format_prompt(model, item['prompt']) for item in dataset]
+    # Get activations for this layer only
+    layer_activations = get_layer_activations(prompts, model, layer, batch_size)
+    
+    for idx, result in enumerate(results):
+        if result['pred_answer'] == result['correct_answer']:
+            activation = layer_activations[idx]
+            data.append(activation.tolist() + [result['pred_answer']])
+    
+    # Clear activations to save memory
     del layer_activations
     torch.cuda.empty_cache()
     gc.collect()
-# %%
-# Get activations
-print("Extracting activations...")
-train_activations = get_resid_activations(train_prompts, model)
-print(f"Train activations shape: {train_activations.shape}")
-# %%
-# Generate predictions
-print("Generating predictions...")
-train_predictions = generate_predictions(train_prompts, model)
-print(f"Generated predictions for {len(train_predictions)} examples")
-
-# %% Process test data
-print("Processing test data...")
-test_prompts = [item['prompt'] for item in test_dataset]
-
-# Get activations
-print("Extracting activations...")
-test_activations = get_resid_activations(test_prompts, model)
-print(f"Test activations shape: {test_activations.shape}")
-
-# Generate predictions
-print("Generating predictions...")
-test_predictions = generate_predictions(test_prompts, model)
-print(f"Generated predictions for {len(test_predictions)} examples")
-
-# %% Function to prepare data for probe training
-def prepare_probe_data(results, activations, layer):
-    """Prepare data for training a probe on a specific layer"""
-    data = []
-    for idx, result in enumerate(results):
-        if result['pred_answer'] == result['correct_answer']:
-            activation = activations[idx][layer]
-            data.append(activation.tolist() + [result['pred_answer']])
     
     df = pd.DataFrame(
         data, 
         columns=[f"ac{i}" for i in range(model.cfg.d_model)] + ["pred"]
     )
     df = df[df["pred"].isin(["yes", "no"])]
+    print(f"{len(df)=}")
     return df
 
 # Function to train a probe
@@ -209,7 +269,6 @@ def extract_coef_vector(clf):
     """Extract coefficient vector from trained probe"""
     return clf.coef_[0]
 
-# %% Train probes for all layers
 print("Training probes for all layers...")
 layers = list(range(model.cfg.n_layers))
 all_probes = []
@@ -220,8 +279,8 @@ for layer in layers:
     print(f"\nTraining probe for layer {layer}...")
     
     # Prepare data for this layer
-    train_data = prepare_probe_data(train_predictions, train_activations, layer)
-    test_data = prepare_probe_data(test_predictions, test_activations, layer)
+    train_data = prepare_probe_data_layer(train_predictions, train_dataset, model, layer)
+    test_data = prepare_probe_data_layer(test_predictions, test_dataset, model, layer)
     
     print(f"  Train samples: {len(train_data)}")
     print(f"  Test samples: {len(test_data)}")
@@ -322,7 +381,7 @@ if best_probe is not None:
     print(f"\nTesting best probe (layer {best_layer_idx}) on a few examples:")
     
     # Get a few test examples
-    test_data = prepare_probe_data(test_predictions, test_activations, best_layer_idx)
+    test_data = prepare_probe_data_layer(test_predictions, test_dataset, model, best_layer_idx)
     if len(test_data) > 0:
         X_test = test_data[[col for col in test_data.columns if col.startswith("ac")]]
         y_test = test_data["pred"]
