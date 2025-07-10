@@ -4,8 +4,10 @@ import numpy as np
 import pandas as pd
 import torch
 import os
+import pickle
 import re
 import gc
+from collections import defaultdict
 from copy import deepcopy
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import roc_auc_score
@@ -13,36 +15,41 @@ from sklearn.model_selection import train_test_split
 from typing import Dict, List, Tuple
 import warnings
 warnings.filterwarnings('ignore')
-
+from torch.utils.data import Dataset, DataLoader
 from dotenv import load_dotenv
 load_dotenv()
 from models import ChatModel
 from data_loading import create_cot_dataset, create_dataset
 from utils import generate_with_hooks
+from transformer_lens.utils import Slice
+from matplotlib import pyplot as plt
 
 THINKING = True
-# %% Load the model
-model = ChatModel("google/gemma-2-9b-it", device='cuda', n_devices=2, cache_dir=os.environ['HF_HOME'])
-print(f"Model loaded: {model.model_name}")
-print(f"Number of layers: {model.cfg.n_layers}")
-print(f"Model dimension: {model.cfg.d_model}")
+DATASET_NAME = "logical_deduction"
+# %%
+def load_model():
+    """Load and configure the model"""
+    model = ChatModel("google/gemma-2-9b-it", device='cuda', n_devices=2, cache_dir=os.environ['HF_HOME'])
+    print(f"Model loaded: {model.model_name}")
+    print(f"Number of layers: {model.cfg.n_layers}")
+    print(f"Model dimension: {model.cfg.d_model}")
+    return model
 
-# %%
-import importlib
-importlib.reload(data_loading)
-from data_loading import create_cot_dataset, create_dataset
-# %% Load sports understanding dataset
-print("Loading sports understanding dataset...")
-examples = create_dataset("sports_understanding")
-cot_dataset = create_cot_dataset("sports_understanding", examples, thinking=THINKING)
-print(f"Loaded {len(cot_dataset)} examples")
-# %%
-# Split into train and test
-train_size = 100
-train_dataset, test_dataset = train_test_split(cot_dataset, train_size=train_size, random_state=42)
-print(f"Train size: {len(train_dataset)}, Test size: {len(test_dataset)}")
-# %%
-print("\n".join([turn['content'] for turn in train_dataset[0]['prompt']]))
+def load_dataset(train_size=100):
+    """Load and split the sports understanding dataset"""
+    print("Loading sports understanding dataset...")
+    examples = create_dataset(DATASET_NAME)
+    cot_dataset = create_cot_dataset(DATASET_NAME, examples, thinking=THINKING)
+    print(f"Loaded {len(cot_dataset)} examples")
+    
+    # Split into train and test
+    train_dataset, test_dataset = train_test_split(cot_dataset, train_size=train_size, random_state=42)
+    print(f"Train size: {len(train_dataset)}, Test size: {len(test_dataset)}")
+    return train_dataset, test_dataset
+
+# Load model and dataset
+model = load_model()
+train_dataset, test_dataset = load_dataset()
 
 # %% Function to extract residual activations
 def get_resid_activations(prompts, model, batch_size=1):
@@ -111,7 +118,7 @@ def parse_response(response: str, thinking: bool = True) -> Tuple[str, str]:
         text_answer = "yes" if "yes" in response.lower() else "no"
     return letter, text_answer
 # %%
-def format_prompt(model, prompt):
+def format_prompt(model, prompt) -> str:
     prompt_replaced = []
     last_msg = None
     for msg in prompt:
@@ -163,37 +170,6 @@ def generate_predictions(dataset, model, temperature=0.7, max_new_tokens=100):
         
     return predictions
 
-# %%
-# Clear memory before processing
-torch.cuda.empty_cache()
-gc.collect()
-# %%
-# Generate predictions first (needed for probe training)
-print("Generating predictions...")
-train_predictions = generate_predictions(train_dataset, model)
-print(f"Generated predictions for {len(train_predictions)} examples")
-# Save predictions to file
-print("Saving predictions...")
-torch.save(train_predictions, f"train_predictions_{'cot' if THINKING else 'noncot'}.pt")
-# %%
-letter_accuracy = np.mean([pred['pred_letter'] == pred['correct_letter'] for pred in train_predictions])
-answer_accuracy = np.mean([pred['pred_answer'] == pred['correct_answer'] for pred in train_predictions])
-print(f"Letter Accuracy: {letter_accuracy:.2%}")
-print(f"Answer Accuracy: {answer_accuracy:.2%}")
-# %%
-# Generate test predictions
-print("Generating predictions...")
-test_predictions = generate_predictions(test_dataset, model)
-print(f"Generated predictions for {len(test_predictions)} examples")
-# Save predictions to file
-print("Saving predictions...")
-torch.save(test_predictions, f"test_predictions_{'cot' if THINKING else 'noncot'}.pt")
-# %%
-letter_accuracy = np.mean([pred['pred_letter'] == pred['correct_letter'] for pred in test_predictions])
-answer_accuracy = np.mean([pred['pred_answer'] == pred['correct_answer'] for pred in test_predictions])
-print(f"Letter Accuracy: {letter_accuracy:.2%}")
-print(f"Answer Accuracy: {answer_accuracy:.2%}")
-
 # %% Function to extract activations for a single layer (memory efficient)
 @torch.inference_mode()
 def get_layer_activations(prompts, model, layer, batch_size=1):
@@ -218,9 +194,8 @@ def get_layer_activations(prompts, model, layer, batch_size=1):
         
     # Concatenate all batches
     activations = torch.stack(all_activations, dim=0)
-    print(f"{activations.shape=}")
     return activations
-    
+
 def prepare_probe_data_layer(results, dataset, model, layer, batch_size=1):
     """Prepare data for training a probe on a specific layer - memory efficient"""
     data = []
@@ -229,9 +204,8 @@ def prepare_probe_data_layer(results, dataset, model, layer, batch_size=1):
     layer_activations = get_layer_activations(prompts, model, layer, batch_size)
     
     for idx, result in enumerate(results):
-        if result['pred_answer'] == result['correct_answer']:
-            activation = layer_activations[idx]
-            data.append(activation.tolist() + [result['pred_answer']])
+        activation = layer_activations[idx]
+        data.append(activation.tolist() + [result['pred_answer']])
     
     # Clear activations to save memory
     del layer_activations
@@ -240,10 +214,9 @@ def prepare_probe_data_layer(results, dataset, model, layer, batch_size=1):
     
     df = pd.DataFrame(
         data, 
-        columns=[f"ac{i}" for i in range(model.cfg.d_model)] + ["pred"]
+        columns=pd.Index([f"ac{i}" for i in range(model.cfg.d_model)] + ["pred"])
     )
     df = df[df["pred"].isin(["yes", "no"])]
-    print(f"{len(df)=}")
     return df
 
 # Function to train a probe
@@ -269,127 +242,589 @@ def extract_coef_vector(clf):
     """Extract coefficient vector from trained probe"""
     return clf.coef_[0]
 
-print("Training probes for all layers...")
-layers = list(range(model.cfg.n_layers))
-all_probes = []
-all_coef_vectors = []
-auc_scores = []
+def train_probes_all_layers(model, train_dataset, test_dataset, run_name: str = "2"):
+    """Train probes for all layers of the model and return results"""
 
-for layer in layers:
-    print(f"\nTraining probe for layer {layer}...")
-    
-    # Prepare data for this layer
-    train_data = prepare_probe_data_layer(train_predictions, train_dataset, model, layer)
-    test_data = prepare_probe_data_layer(test_predictions, test_dataset, model, layer)
-    
-    print(f"  Train samples: {len(train_data)}")
-    print(f"  Test samples: {len(test_data)}")
-    
-    if len(train_data) == 0 or len(test_data) == 0:
-        print(f"  Skipping layer {layer} - insufficient data")
-        all_probes.append(None)
-        all_coef_vectors.append(None)
-        auc_scores.append(0)
-        continue
-    
-    # Train probe
-    clf = train_probe(train_data)
-    
-    # Evaluate probe
-    auc_score = evaluate_probe(clf, test_data)
-    auc_scores.append(auc_score)
-    
-    # Extract coefficient vector
-    coef_vector = extract_coef_vector(clf)
-    
-    print(f"  AUROC: {auc_score:.4f}")
-    
-    all_probes.append(clf)
-    all_coef_vectors.append(coef_vector)
+    save_dir = f"../results/probes/{model.model_name}/{run_name}/{DATASET_NAME}/"
+    os.makedirs(save_dir, exist_ok=True)
+    train_predictions = generate_predictions(train_dataset, model)
+    test_predictions = generate_predictions(test_dataset, model)
 
-print(f"\nProbe training completed for {len(layers)} layers")
+    print("Training probes for all layers...")
+    layers = list(range(model.cfg.n_layers))
+    all_probes = []
+    all_coef_vectors = []
+    auc_scores = []
 
-# %% Analyze results
-print("\n=== PROBE TRAINING RESULTS ===")
-print(f"Best layer: {layers[np.argmax(auc_scores)]}")
-print(f"Best AUROC: {np.max(auc_scores):.4f}")
-print(f"Average AUROC: {np.mean(auc_scores):.4f}")
-print(f"Std AUROC: {np.std(auc_scores):.4f}")
+    for layer in layers:
+        print(f"\nTraining probe for layer {layer}...")
+        
+        # Prepare data for this layer
+        train_data = prepare_probe_data_layer(train_predictions, train_dataset, model, layer)
+        test_data = prepare_probe_data_layer(test_predictions, test_dataset, model, layer)
+        
+        print(f"  Train samples: {len(train_data)}")
+        print(f"  Test samples: {len(test_data)}")
+        
+        if len(train_data) == 0 or len(test_data) == 0:
+            print(f"  Skipping layer {layer} - insufficient data")
+            all_probes.append(None)
+            all_coef_vectors.append(None)
+            auc_scores.append(0)
+            continue
+        
+        # Train probe
+        clf = train_probe(train_data)
+        
+        # Evaluate probe
+        auc_score = evaluate_probe(clf, test_data)
+        auc_scores.append(auc_score)
+        
+        # Extract coefficient vector
+        coef_vector = extract_coef_vector(clf)
+        
+        print(f"  AUROC: {auc_score:.4f}")
+        
+        all_probes.append(clf)
+        all_coef_vectors.append(coef_vector)
 
-# Show top 5 layers
-print("\nTop 5 layers by AUROC:")
-top_indices = np.argsort(auc_scores)[::-1][:5]
-for i, idx in enumerate(top_indices):
-    print(f"  {i+1}. Layer {layers[idx]}: AUROC = {auc_scores[idx]:.4f}")
+    print(f"\nProbe training completed for {len(layers)} layers")
 
-# Show bottom 5 layers
-print("\nBottom 5 layers by AUROC:")
-bottom_indices = np.argsort(auc_scores)[:5]
-for i, idx in enumerate(bottom_indices):
-    print(f"  {i+1}. Layer {layers[idx]}: AUROC = {auc_scores[idx]:.4f}")
+    # Save train and test datasets
+    print("\nSaving datasets...")
+    dataset_path = os.path.join(save_dir, "datasets.pkl")
+    datasets = {
+        "train_data": train_dataset,
+        "test_data": test_dataset,
+        "train_predictions": train_predictions,
+        "test_predictions": test_predictions
+    }
+    with open(dataset_path, "wb") as f:
+        pickle.dump(datasets, f)
+    print(f"Datasets saved to {dataset_path}")
 
-# %% Visualize AUROC scores across layers
-import matplotlib.pyplot as plt
+    print("\nSaving probes and results...")
+    os.makedirs(save_dir, exist_ok=True)
 
-plt.figure(figsize=(12, 6))
-plt.plot(layers, auc_scores, 'b-o', linewidth=2, markersize=6)
+    # Save probes using pickle
+    probe_path = os.path.join(save_dir, f"probes.pkl")
+    with open(probe_path, "wb") as f:
+        pickle.dump(all_probes, f)
+    print(f"Probes saved to {probe_path}")
+
+
+    # Save AUC scores as JSON
+    scores_path = os.path.join(save_dir, f"auc_scores.json")
+    scores_data = {
+        "layer_scores": {str(layer): score for layer, score in zip(layers, auc_scores)},
+        "best_layer": int(layers[np.argmax(auc_scores)]),
+        "best_score": float(np.max(auc_scores))
+    }
+    with open(scores_path, "w") as f:
+        json.dump(scores_data, f, indent=2)
+    print(f"AUC scores saved to {scores_path}")
+
+    plt.figure(figsize=(12, 6))
+    plt.plot(layers, auc_scores, marker='o')
+    plt.grid(True)
+    plt.xlabel('Layer')
+    plt.ylabel('AUROC Score')
+    plt.title('AUROC Scores by Layer')
+    plt.ylim(0.0, 1.0)
+
+    # Add horizontal lines for mean and best scores
+    mean_score = float(np.mean(auc_scores))
+    max_score = float(np.max(auc_scores))
+    plt.axhline(y=mean_score, color='r', linestyle='--', label=f'Mean ({mean_score:.3f})')
+    plt.axhline(y=max_score, color='g', linestyle='--', label=f'Best ({max_score:.3f})')
+
+    plt.legend()
+    plt.tight_layout()
+
+    # Save the plot
+    plot_path = os.path.join(save_dir, f"auc_scores.png")
+    plt.savefig(plot_path)
+    print(f"AUC scores plot saved to {plot_path}")
+    plt.close()
+    
+    return all_probes, all_coef_vectors, auc_scores
+
+def load_probes(model, run_name: str = "2"):
+    save_dir = f"../results/probes/{model.model_name}/{run_name}/{DATASET_NAME}/"
+    probe_path = os.path.join(save_dir, "probes.pkl")
+    with open(probe_path, "rb") as f:
+        all_probes = pickle.load(f)
+    return all_probes
+
+def load_probes_from_position(model, run_name: str = "2", position=None, use_all_positions=False):
+    """Load probes from position-specific directory"""
+    save_dir = f"../results/probes/{model.model_name}/{run_name}/{DATASET_NAME}/"
+    
+    # Determine position-specific directory
+    if use_all_positions:
+        pos_suffix = "all_positions"
+    elif position is not None:
+        pos_suffix = f"position_{position}"
+    else:
+        pos_suffix = "last_position"
+    
+    save_dir = os.path.join(save_dir, pos_suffix)
+    probe_path = os.path.join(save_dir, "probes.pkl")
+    
+    if not os.path.exists(probe_path):
+        raise FileNotFoundError(f"Probes not found at {probe_path}. Train probes first.")
+    
+    with open(probe_path, "rb") as f:
+        all_probes = pickle.load(f)
+    return all_probes
+
+# %%
+def save_residuals_over_time(model, dataset, run_name: str = "2"):
+    """Save residual activations over time for each example in the dataset"""
+    save_dir = f"../results/probes/{model.model_name}/{run_name}/{DATASET_NAME}/residuals/"
+    os.makedirs(save_dir, exist_ok=True)
+
+    print("Generating residual activations over time...")
+    for i, example in enumerate(dataset):
+        print(f"\nProcessing example {i+1}/{len(dataset)}")
+        
+        # Format prompt and generate response
+        prompt = format_prompt(model, example['prompt'])
+        tokens = model.to_tokens([prompt], prepend_bos=True)
+        
+        # Generate response and get cache
+        generation = model.generate(
+            tokens[:, :-2],
+            max_new_tokens=100,
+            temperature=0.7,
+            do_sample=True,
+        )
+        
+        # Run with cache to get activations
+        with torch.inference_mode():
+            _, cache = model.run_with_cache(generation)
+        
+        # Extract residual activations for each layer
+        residuals = {}
+        for layer in range(model.cfg.n_layers):
+            layer_activations = cache["resid_post", layer]
+            layer_activations = layer_activations.squeeze().detach().cpu()
+            residuals[f"layer_{layer}"] = layer_activations
+            
+        # Accumulate data for all examples
+        if i == 0:
+            all_data = {
+                "prompts": [prompt],
+                "responses": [model.tokenizer.decode(generation[0])],
+                "residuals": [residuals]
+            }
+        else:
+            all_data["prompts"].append(prompt)
+            all_data["responses"].append(model.tokenizer.decode(generation[0]))
+            all_data["residuals"].append(residuals)
+            
+        # Save accumulated data after processing each example
+        data_path = os.path.join(save_dir, "all_residuals.pkl")
+        with open(data_path, "wb") as f:
+            pickle.dump(all_data, f)
+            
+        # Clean up to save memory
+        del tokens, generation, cache, residuals
+        torch.cuda.empty_cache()
+        gc.collect()
+        
+    print("\nResidual activations saved successfully")
+
+# train_probes_all_layers(model, train_dataset, test_dataset, run_name="5")
+# save_residuals_over_time(model, train_dataset, run_name="5")
+# %%
+class TestDataset(torch.utils.data.Dataset):
+    def __init__(self, data: List[Dict], model: ChatModel):
+        self.data = data
+        self.model = model
+
+    def __len__(self) -> int:
+        return len(self.data)
+
+    def __getitem__(self, idx: int) -> Tuple[str, str, str]:
+        item = self.data[idx]
+        prompt = format_prompt(self.model, item['prompt'])
+        return prompt, item["correct_answer"], item["correct_letter"]
+# %% 
+def right_to_left_pad(tokens, model):
+    """Move padding tokens from right to left side of sequences"""
+    # Get number of padding tokens at end of each sequence
+    pad_lens = (tokens == model.tokenizer.pad_token_id).sum(dim=1)
+
+    # Create mask of padding tokens same shape as input
+    pad_mask = torch.full_like(tokens, model.tokenizer.pad_token_id)
+
+    # Create position indices for each sequence
+    positions = torch.arange(tokens.shape[1], device=tokens.device).unsqueeze(0).expand_as(tokens)
+
+    # Roll tokens left by padding length to move padding to front
+    shifted_tokens = torch.stack([torch.roll(seq, shift.item()) for seq, shift in zip(tokens, pad_lens)])
+    return shifted_tokens
+# %%
+# %%
+def generate_and_save_predictions(model, test_dataset, test_loader, all_probes, run_name):
+    """Generate predictions using probes and model, and save results"""
+    preds_per_layer = defaultdict(lambda: np.empty((0, 2)))
+    model_preds = []
+    
+    for batch in test_loader:
+        tokens = model.to_tokens(batch[0], prepend_bos=True)
+        tokens = right_to_left_pad(tokens, model)
+        
+        with torch.inference_mode():
+            _, cache = model.run_with_cache(tokens, pos_slice=-1)
+            
+        # Get probe predictions for each layer
+        for layer_num in range(model.cfg.n_layers):
+            probe = all_probes[layer_num]
+            activations = cache["resid_post", layer_num]
+            activations = activations[:, 0, :].cpu().float()
+            pred = probe.predict_proba(activations)
+            preds_per_layer[layer_num] = np.concatenate([preds_per_layer[layer_num], pred], axis=0)
+            
+        # Generate model predictions
+        generation_tokens = model.generate(
+            tokens[:, :-2],
+            max_new_tokens=100,
+            temperature=0.7,
+            do_sample=True
+        )
+        response = model.to_string(generation_tokens)
+        letters, text_answers = zip(*[parse_response(r, thinking=THINKING) for r in response])
+        model_preds.extend(text_answers)
+
+    # Get test answers
+    test_answers = [item["correct_answer"] for item in test_dataset][:len(model_preds)]
+
+    results = {
+        "model_predictions": model_preds,
+        "probe_predictions_per_layer": dict(preds_per_layer),
+        "test_answers": test_answers
+    }
+
+    # Save results
+    save_dir = f"../results/predictions/{model.model_name}/{run_name}/{DATASET_NAME}"
+    os.makedirs(save_dir, exist_ok=True)
+    with open(os.path.join(save_dir, "predictions.pkl"), "wb") as f:
+        pickle.dump(results, f)
+
+    print(f"Saved predictions to {save_dir}/predictions.pkl")
+    return results
+
+# Generate and save predictions
+# data = TestDataset(test_dataset, model)
+# all_probes = load_probes(model, run_name="5")
+# test_loader = DataLoader(data, batch_size=5, shuffle=False)
+# results = generate_and_save_predictions(model, test_dataset, test_loader, all_probes, run_name="6")
+# %%
+# Load predictions and compute AUROC scores
+from sklearn.metrics import roc_auc_score
+
+def compute_auroc_scores(results):
+    """Compute AUROC scores for each layer's probe predictions"""
+    test_answers = results["test_answers"]
+    model_preds = results["model_predictions"]
+    probe_preds = results["probe_predictions_per_layer"]
+    
+    # Convert answers to binary (yes=1, no=0)
+    y_true = np.array([1 if ans.lower() == "yes" else 0 for ans in test_answers])
+    y_model = np.array([1 if pred.lower() == "yes" else 0 for pred in model_preds])
+    
+    # Compute model accuracy
+    model_acc = np.mean(y_true == y_model)
+    
+    # Compute AUROC for each layer against ground truth and model predictions
+    scores = {"vs_truth": {}, "vs_model": {}, "acc_truth": {}, "acc_model": {}}
+    for layer, preds in probe_preds.items():
+        # Use probability of "yes" class
+        y_pred = preds[:, 1]
+        
+        # AUROC against ground truth
+        auroc_truth = roc_auc_score(y_true, y_pred)
+        scores["vs_truth"][layer] = auroc_truth
+        
+        # AUROC against model predictions
+        auroc_model = roc_auc_score(y_model, y_pred)
+        scores["vs_model"][layer] = auroc_model
+
+        # Accuracy against ground truth
+        acc_truth = np.mean(y_true == preds.argmax(axis=1))
+        scores["acc_truth"][layer] = acc_truth
+
+        # Accuracy against model predictions
+        acc_model = np.mean(y_model == preds.argmax(axis=1))
+        scores["acc_model"][layer] = acc_model
+
+    layers = list(probe_preds.keys())
+
+    # Plot accuracy results in separate figure
+    plt.figure(figsize=(10, 6))
+    plt.plot(layers, [scores["acc_truth"][l] for l in layers],
+            label="Probe Accuracy vs Ground Truth", marker='o', color='blue', linestyle='--')
+    plt.plot(layers, [scores["acc_model"][l] for l in layers],
+            label="Probe Accuracy vs Model", marker='o', color='red', linestyle='--')
+    plt.axhline(y=model_acc, color='r', linestyle='--',
+                label=f'Model Accuracy ({model_acc:.3f})')
+    plt.xlabel("Layer")
+    plt.ylabel("Accuracy")
+    plt.title("Probe Accuracy Across Layers")
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+    
+    # Plot results
+    plt.figure(figsize=(10, 6))
+    
+    plt.plot(layers, [scores["vs_truth"][l] for l in layers], 
+             label="Probe vs Ground Truth", marker='o')
+    plt.plot(layers, [scores["vs_model"][l] for l in layers],
+             label="Probe vs Model", marker='o')
+    
+    plt.xlabel("Layer")
+    plt.ylabel("AUROC")
+    plt.title("Probe AUROC Across Layers")
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+    
+    return scores
+
+# # Load saved predictions
+# save_dir = f"../results/predictions/google/gemma-2-9b-it/6/logical_deduction"
+# # save_dir = f"../results/predictions/{model.model_name}/6/{DATASET_NAME}"
+# with open(os.path.join(save_dir, "predictions.pkl"), "rb") as f:
+#     results = pickle.load(f)
+
+# # Compute and print AUROC scores
+# scores = compute_auroc_scores(results)
+# print("\nAUROC scores per layer:")
+# scores.keys()
+# for layer, score in scores["vs_truth"].items():
+#     print(f"{layer=}")
+#     print(f"{score=}")
+#     print(f"Layer {layer}: {score:.3f}")
+
+# %%
+def sample(logits, temperature=0.7):
+    scaled_logits = logits / temperature
+    probs = torch.nn.functional.softmax(scaled_logits, dim=-1)
+    sampled_tokens = torch.multinomial(probs, num_samples=1)
+    return sampled_tokens
+
+def generate_and_cache_all_layers(batch, model, max_new_tokens=100, temperature=0.7):
+    """Generate response and cache activations for all layers"""
+    batch_size = batch.shape[0]
+    
+    # Initialize cache storage for all layers
+    all_layer_caches = {layer: torch.empty(batch_size, 0, model.cfg.d_model) 
+                       for layer in range(model.cfg.n_layers)}
+    
+    # Start with the input tokens (excluding the last 2 tokens as in original code)
+    response = batch[:, :-2].to('cpu')
+    
+    # Generate tokens one by one
+    for _ in range(max_new_tokens):
+        with torch.inference_mode():
+            logits, cache = model.run_with_cache(response.to(model.device), pos_slice=-1)
+            
+            # Store activations for all layers at this position
+            for layer in range(model.cfg.n_layers):
+                layer_activations = cache['resid_post', layer]
+                all_layer_caches[layer] = torch.cat([all_layer_caches[layer], layer_activations.cpu()], dim=1)
+            
+            # Sample next token
+            sampled_tokens = sample(logits[:, -1, :], temperature)
+            response = torch.cat([response, sampled_tokens.cpu()], dim=1)
+            
+            # Check if all sequences have reached EOS
+            if (response[:, -1] == model.tokenizer.eos_token_id).all():
+                break
+    
+    eos_mask = (response == model.tokenizer.eos_token_id)[:, batch.shape[1] - 2:]
+    for layer in all_layer_caches:
+        all_layer_caches[layer] = [all_layer_caches[layer][i][~eos_mask[i]] for i in range(batch_size)]
+    response = [resp[batch.shape[1] - 2:][~eos_mask[i]] for i, resp in enumerate(response)]
+    return response, all_layer_caches
+
+def generate_and_save_trainset_cache(model, train_dataset, batch_size=4, max_new_tokens=100, temperature=0.7, run_name="trainset_cache"):
+    """Generate responses and save activations for all layers on the entire trainset"""
+    print(f"Generating and caching activations for {len(train_dataset)} training examples...")
+    
+    # Create dataloader
+    train_data = TestDataset(train_dataset, model)
+    train_loader = DataLoader(train_data, batch_size=batch_size, shuffle=False)
+    
+    # Storage for all results
+    all_responses = []
+    all_layer_caches = {layer: [] for layer in range(model.cfg.n_layers)}
+    all_prompts = []
+    all_correct_answers = []
+    all_correct_letters = []
+    
+    for batch_idx, (prompts, correct_answers, correct_letters) in enumerate(train_loader):
+        print(f"Processing batch {batch_idx + 1}/{len(train_loader)}")
+        
+        # Tokenize prompts
+        tokens = model.to_tokens(prompts, prepend_bos=True)
+        tokens_padded = right_to_left_pad(tokens, model)
+        
+        # Generate responses and cache all layers
+        responses, layer_caches = generate_and_cache_all_layers(
+            tokens_padded, model, max_new_tokens, temperature
+        )
+        
+        # Store results
+        all_responses.extend([model.to_string(resp) for resp in responses])
+        all_prompts.extend(prompts)
+        all_correct_answers.extend(correct_answers)
+        all_correct_letters.extend(correct_letters)
+        
+        # Store layer caches
+        for layer in range(model.cfg.n_layers):
+            all_layer_caches[layer].extend(layer_caches[layer])
+        
+        # Clean up
+        del tokens, tokens_padded, responses, layer_caches
+        torch.cuda.empty_cache()
+        gc.collect()
+    
+    # Concatenate all layer caches
+    # Compile results
+    results = {
+        'responses': all_responses,
+        'prompts': all_prompts,
+        'correct_answers': all_correct_answers,
+        'correct_letters': all_correct_letters,
+        'layer_caches': all_layer_caches,
+        'metadata': {
+            'num_examples': len(all_responses),
+            'batch_size': batch_size,
+            'max_new_tokens': max_new_tokens,
+            'temperature': temperature,
+            'num_layers': model.cfg.n_layers,
+            'model_name': model.model_name
+        }
+    }
+    
+    # Save results
+    save_dir = f"../results/cache/{model.model_name}/{run_name}/{DATASET_NAME}"
+    os.makedirs(save_dir, exist_ok=True)
+    
+    # Save main results
+    results_path = os.path.join(save_dir, "trainset_cache.pkl")
+    with open(results_path, "wb") as f:
+        pickle.dump(results, f)
+    print(f"Saved main results to {results_path}")
+    
+    # Save layer caches separately for easier access
+    for layer in range(model.cfg.n_layers):
+        layer_cache_path = os.path.join(save_dir, f"layer_{layer}_cache.pt")
+        torch.save(all_layer_caches[layer], layer_cache_path)
+        print(f"Saved layer {layer} cache to {layer_cache_path}")
+    
+    # Save metadata
+    metadata_path = os.path.join(save_dir, "metadata.json")
+    with open(metadata_path, "w") as f:
+        json.dump(results['metadata'], f, indent=2)
+    print(f"Saved metadata to {metadata_path}")
+    
+    print(f"Successfully processed {len(all_responses)} training examples")
+    return results
+
+def load_trainset_cache(model, run_name="trainset_cache"):
+    """Load cached trainset results"""
+    save_dir = f"../results/cache/{model.model_name}/{run_name}/{DATASET_NAME}"
+    
+    # Load main results
+    results_path = os.path.join(save_dir, "trainset_cache.pkl")
+    with open(results_path, "rb") as f:
+        results = pickle.load(f)
+    
+    # Load layer caches
+    layer_caches = {}
+    for layer in range(model.cfg.n_layers):
+        layer_cache_path = os.path.join(save_dir, f"layer_{layer}_cache.pt")
+        layer_caches[layer] = torch.load(layer_cache_path)
+    
+    results['layer_caches'] = layer_caches
+    return results
+
+
+
+# # %% Example usage for trainset caching
+# # Generate and save cache for entire trainset
+# results = generate_and_save_trainset_cache(
+#     model=model,
+#     train_dataset=train_dataset,
+#     batch_size=4,  # Adjust based on your GPU memory
+#     max_new_tokens=100,
+#     temperature=0.7,
+#     run_name="trainset_cache_v2"
+# )
+
+# %%
+results = generate_and_save_trainset_cache(
+    model=model,
+    train_dataset=test_dataset,
+    batch_size=16,  # Adjust based on your GPU memory
+    max_new_tokens=100,
+    temperature=0.7,
+    run_name="testset_cache_v2"
+)
+# %%
+results = load_trainset_cache(model, run_name="trainset_cache_v2")
+results_test = load_trainset_cache(model, run_name="testset_cache_v2")
+# %%
+batch_size = 4
+
+Y_train = []
+for i, label in enumerate(results['correct_answers']):
+    seq_len = len(results['layer_caches'][0][i])
+    Y_train.extend([label] * seq_len)
+Y_binary_train = [1 if y == "yes" else 0 for y in Y]
+
+Y_test = []
+for i, label in enumerate(results_test['correct_answers']):
+    seq_len = len(results_test['layer_caches'][0][i])
+    Y_test.extend([label] * seq_len)
+Y_binary_test = [1 if y == "yes" else 0 for y in Y_test]
+
+
+layer_scores = []
+for layer in range(model.cfg.n_layers):
+    X = torch.cat(results['layer_caches'][layer], dim=0)
+    probe = LogisticRegression(random_state=0)
+    probe.fit(X, Y_binary_train)
+    X_test = torch.cat(results_test['layer_caches'][layer], dim=0)
+    y_pred_proba = probe.predict_proba(X_test)[:, 1]
+    auc_score = roc_auc_score(Y_binary_test, y_pred_proba)
+    print(f"Layer {layer} AUROC score: {auc_score:.4f}")
+    
+    # Save probe
+    save_dir = f"../results/probes/{model.model_name}/sequence_probes/{DATASET_NAME}/"
+    os.makedirs(save_dir, exist_ok=True)
+    probe_path = os.path.join(save_dir, f"probe_layer_{layer}.pkl")
+    with open(probe_path, "wb") as f:
+        pickle.dump(probe, f)
+    
+    # Store score for plotting
+    layer_scores.append(auc_score)
+    
+# %%
+# Plot scores
+plt.figure(figsize=(10, 6))
+plt.plot(range(model.cfg.n_layers), layer_scores, marker='o')
 plt.xlabel('Layer')
 plt.ylabel('AUROC Score')
-plt.title('Probe Performance Across Layers - Sports Understanding Task')
-plt.grid(True, alpha=0.3)
+plt.title('AUROC Scores by Layer')
 plt.ylim(0, 1)
+plt.grid(True)
+plt.savefig(os.path.join(save_dir, 'auroc_scores.png'))
+plt.close()
 
-# Highlight best layer
-best_layer = layers[np.argmax(auc_scores)]
-best_auc = np.max(auc_scores)
-plt.plot(best_layer, best_auc, 'ro', markersize=10, label=f'Best: Layer {best_layer} (AUROC={best_auc:.3f})')
-plt.legend()
-
-plt.tight_layout()
-plt.show()
-
-# %% Save results
-results = {
-    'layers': layers,
-    'auc_scores': auc_scores,
-    'all_probes': all_probes,
-    'all_coef_vectors': all_coef_vectors,
-    'best_layer': layers[np.argmax(auc_scores)],
-    'best_auc': np.max(auc_scores),
-    'train_size': len(train_dataset),
-    'test_size': len(test_dataset)
-}
-
-print("Results summary:")
-print(f"  Best layer: {results['best_layer']}")
-print(f"  Best AUROC: {results['best_auc']:.4f}")
-print(f"  Train samples: {results['train_size']}")
-print(f"  Test samples: {results['test_size']}")
-print(f"  Total probes trained: {len([p for p in all_probes if p is not None])}")
-
-# You can save the results to a file if needed
-# import pickle
-# with open('sports_understanding_probes.pkl', 'wb') as f:
-#     pickle.dump(results, f)
-
-# %% Optional: Test a specific probe
-# Test the best probe on a few examples
-best_layer_idx = np.argmax(auc_scores)
-best_probe = all_probes[best_layer_idx]
-
-if best_probe is not None:
-    print(f"\nTesting best probe (layer {best_layer_idx}) on a few examples:")
-    
-    # Get a few test examples
-    test_data = prepare_probe_data_layer(test_predictions, test_dataset, model, best_layer_idx)
-    if len(test_data) > 0:
-        X_test = test_data[[col for col in test_data.columns if col.startswith("ac")]]
-        y_test = test_data["pred"]
-        
-        # Make predictions
-        predictions = best_probe.predict(X_test)
-        probabilities = best_probe.predict_proba(X_test)
-        
-        print(f"Sample predictions (first 5):")
-        for i in range(min(5, len(predictions))):
-            print(f"  True: {y_test.iloc[i]}, Pred: {predictions[i]}, Prob: {probabilities[i][1]:.3f}") 
+# %%
