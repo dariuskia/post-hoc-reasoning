@@ -828,3 +828,68 @@ plt.savefig(os.path.join(save_dir, 'auroc_scores.png'))
 plt.close()
 
 # %%
+prompt = format_prompt(model, test_dataset[sample_num]['prompt'])
+batch = model.to_tokens([prompt], prepend_bos=True)
+response, all_cache = generate_and_cache_all_layers(batch, model, max_new_tokens=100, temperature=0.7)
+# %%
+save_dir = f"../results/probes/{model.model_name}/sequence_probes/{DATASET_NAME}/"
+probe_path = os.path.join(save_dir, f"probe_layer_24.pkl")
+with open(probe_path, "rb") as f:
+    probe = pickle.load(f)
+# %%
+# Load probe for layer 24
+sample_num = 17
+
+data = results_test
+# Get activations for layer 24 and run inference
+activations = data['layer_caches'][24][sample_num]
+predictions = probe.predict_proba(activations)[:, 1]  # Get probability of "yes" class
+print(f"Mean prediction: {predictions.mean():.3f}")
+print(f"Predictions over time: {predictions}")
+# Get correct answer from test dataset
+pred_answer = data['pred_answers'][sample_num].lower()
+print(f"Pred answer: {pred_answer}")
+# 
+# Plot predictions over time
+plt.figure(figsize=(10, 6))
+plt.plot(predictions, marker='o')
+plt.xlabel('Token Position')
+plt.ylabel('Probability of "Yes"')
+plt.title('Probe Predictions Over Generation')
+plt.ylim(0, 1)
+plt.grid(True)
+plt.show()
+
+# %%
+# plt.plot(probe.predict_proba(activations)[:, 1].cumsum())# %%
+# parse_response(results['responses'][10])
+results_test['pred_answers']
+# %%
+[results_test['pred_answers'][i] for i in range(len(results_test['pred_answers'])) if results_test['pred_answers'][i] == 'yes']
+# %%
+# results_test['all_layer_caches'][24][17]
+print(sum([probe.predict_proba(results_test['layer_caches'][24][i])[:, 1].sum() for i in range(len(results_test['pred_answers'])) if results_test['pred_answers'][i] == 'yes']) / len(results_test['pred_answers']))
+print(sum([probe.predict_proba(results_test['layer_caches'][24][i])[:, 1].sum() for i in range(len(results_test['pred_answers'])) if results_test['pred_answers'][i] == 'no']) / len(results_test['pred_answers']))
+# %%
+probe_preds = [probe.predict_proba(results_test['layer_caches'][24][i])[:, 1] for i in range(len(results_test['pred_answers'])) if results_test['pred_answers'][i] == 'no']
+# for pred in probe_preds:
+# Collect all predictions into one array
+all_preds = []
+for pred in probe_preds:
+    x = np.linspace(0, 1, pred.shape[0])
+    all_preds.append(np.column_stack((x, pred)))
+all_preds = np.vstack(all_preds)
+
+# Create single plot
+plt.figure(figsize=(10,6))
+plt.scatter(all_preds[:,0], all_preds[:,1], alpha=0.3)
+
+# Calculate and plot line of best fit
+z = np.polyfit(all_preds[:,0], all_preds[:,1], 1)
+p = np.poly1d(z)
+plt.plot(all_preds[:,0], p(all_preds[:,0]), "r--", alpha=0.8)
+
+plt.xlabel('Normalized Position')
+plt.ylabel('Probe Prediction')
+plt.title('Probe Predictions Over Generation (All Samples)')
+plt.show()
