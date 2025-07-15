@@ -786,7 +786,7 @@ Y_train = []
 for i, label in enumerate(results['correct_answers']):
     seq_len = len(results['layer_caches'][0][i])
     Y_train.extend([label] * seq_len)
-Y_binary_train = [1 if y == "yes" else 0 for y in Y]
+Y_binary_train = [1 if y == "yes" else 0 for y in Y_train]
 
 Y_test = []
 for i, label in enumerate(results_test['correct_answers']):
@@ -893,3 +893,137 @@ plt.xlabel('Normalized Position')
 plt.ylabel('Probe Prediction')
 plt.title('Probe Predictions Over Generation (All Samples)')
 plt.show()
+
+
+
+
+
+
+# %%
+results = load_trainset_cache(model, run_name="trainset_cache_v2")
+# %%
+results_test = load_trainset_cache(model, run_name="testset_cache_v2")
+# %%
+results_test['pred_answers'] = [parse_response(results_test['responses'][i])[1] for i in range(len(results_test['responses']))]
+results['pred_answers'] = [parse_response(results['responses'][i])[1] for i in range(len(results['responses']))]
+# %%
+def analyze_token_positions(model, results, results_test, token_pcts=None):
+    """Analyze probe performance at different token positions in the sequence.
+    
+    Args:
+        model: The model being analyzed
+        results: Dictionary containing training data and results
+        results_test: Dictionary containing test data and results 
+        token_pcts: List of token percentages to analyze. Defaults to [0.1, 0.2, ..., 0.9]
+    
+    Returns:
+        train_accs_by_pct: Dict mapping token percentages to list of training accuracies
+        test_aurocs_by_pct: Dict mapping token percentages to list of test AUROCs
+    """
+    if token_pcts is None:
+        token_pcts = [i/10 for i in range(1, 10)]
+        
+    num_samples = len(results['layer_caches'][0])
+    num_layers = model.cfg.n_layers
+
+    # Lists to store metrics for each token percentage
+    train_accs_by_pct = {pct: [] for pct in token_pcts}
+    test_aurocs_by_pct = {pct: [] for pct in token_pcts}
+
+    for token_pct in token_pcts:
+        print(f"\nAnalyzing token percentage: {token_pct}")
+        
+        for layer_idx in range(num_layers):
+            training_data_list = []
+            for sample_idx in range(num_samples):
+                resid = results['layer_caches'][layer_idx][sample_idx]
+                seq_len, _ = resid.shape
+                training_data_list.append(resid[int(seq_len * token_pct), :])
+            training_data = torch.stack(training_data_list)
+            
+            # Train probe for this layer
+            X = training_data.numpy()
+            y = np.array([1 if ans == 'yes' else 0 for ans in results['pred_answers']])
+            
+            # Initialize and train probe
+            probe = LogisticRegression(random_state=42, max_iter=1000)
+            probe.fit(X, y)
+            
+            # Store probe accuracy and AUROC
+            train_acc = probe.score(X, y)
+            train_accs_by_pct[token_pct].append(train_acc)
+            
+            # Get test data for this layer
+            test_data_list = []
+            for sample_idx in range(len(results_test['layer_caches'][0])):
+                resid = results_test['layer_caches'][layer_idx][sample_idx]
+                seq_len, _ = resid.shape
+                test_data_list.append(resid[int(seq_len * token_pct), :])
+            test_data = torch.stack(test_data_list).numpy()
+            test_y = np.array([1 if ans == 'yes' else 0 for ans in results_test['pred_answers']])
+            
+            # Compute AUROC on test data
+            test_probs = probe.predict_proba(test_data)[:, 1]
+            test_auroc = roc_auc_score(test_y, test_probs)
+            test_aurocs_by_pct[token_pct].append(test_auroc)
+            
+            print(f"Layer {layer_idx} - Train acc: {train_acc:.3f}, Test AUROC: {test_auroc:.3f}")
+            
+            # Clean up to save memory
+            del X, y, training_data, training_data_list
+            gc.collect()
+            
+    return train_accs_by_pct, test_aurocs_by_pct
+
+def plot_token_position_results(token_pcts, test_aurocs_by_pct, num_layers):
+    """Plot the results of token position analysis.
+    
+    Args:
+        token_pcts: List of token percentages analyzed
+        test_aurocs_by_pct: Dict mapping token percentages to list of test AUROCs
+        num_layers: Number of model layers
+    """
+    # Plot AUROC across layers for each token percentage
+    plt.figure(figsize=(12,8))
+    for token_pct in token_pcts:
+        plt.plot(range(num_layers), test_aurocs_by_pct[token_pct], 
+                 marker='o', label=f'Token {int(token_pct*100)}%')
+    plt.xlabel('Layer')
+    plt.ylabel('Test AUROC')
+    plt.title('Test AUROC by Layer for Different Token Positions')
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+
+    # Create color gradient plot
+    colors = plt.cm.viridis(np.linspace(0, 1, len(token_pcts)))
+    plt.figure(figsize=(12,8))
+    for idx, token_pct in enumerate(token_pcts):
+        plt.plot(range(num_layers), test_aurocs_by_pct[token_pct],
+                 marker='o', label=f'Token {int(token_pct*100)}%',
+                 color=colors[idx])
+    plt.xlabel('Layer')
+    plt.ylabel('Test AUROC')
+    plt.title('Test AUROC by Layer for Different Token Positions')
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+
+    # Calculate and plot average AUROC across layers
+    avg_aurocs = []
+    for token_pct in token_pcts:
+        avg_auroc = np.mean(test_aurocs_by_pct[token_pct])
+        avg_aurocs.append(avg_auroc)
+
+    plt.figure(figsize=(10,6))
+    plt.bar(range(len(token_pcts)), avg_aurocs, color=colors)
+    plt.xticks(range(len(token_pcts)), [f'{int(pct*100)}%' for pct in token_pcts])
+    plt.xlabel('Token Position')
+    plt.ylabel('Average Test AUROC')
+    plt.title('Average Test AUROC Across Layers by Token Position')
+    plt.grid(True, axis='y')
+    plt.show()
+
+
+ #%%
+test_dataset[0]['prompt'][-2]
