@@ -39,9 +39,9 @@ def load_cot_prompt(task_name: str, example_type: Literal["yes", "no", "neutral"
     with open(f"../data/{task_name}/{task_name}_cot_{example_type}.json", "r") as f:
         prompt = json.load(f)
     for row in prompt:
-        if use_thinking and 'thinking' in row:
-            row['content'] = f"<think>{row['thinking']}</think>\n\n{row['content']}"
-        row.pop('thinking', None)
+        thinking = row.pop('thinking', None)
+        if use_thinking and thinking:
+            row['content'] = f"<think>{thinking}</think>\n\n{row['content']}"
     return prompt
 # %%
 def create_fewshot_dataset(name, examples, use_thinking=True, bias_type: Literal["positive", "negative", "neutral"] = "neutral"):
