@@ -259,7 +259,7 @@ def generate_with_nnsight(model, toks, max_new_tokens=1000, temperature=0.6):
 @torch.inference_mode()
 def generate_with_vllm(model, toks, max_new_tokens=1000, temperature=0.6):
     sampling_params = SamplingParams(max_tokens=max_new_tokens, temperature=temperature)
-    prompt = [TokensPrompt(tok) for tok in toks]
+    prompt = [TokensPrompt(prompt_token_ids=tok) for tok in toks]
     out = model.generate(prompt, sampling_params=sampling_params)
     return [torch.tensor(o.outputs[0].token_ids) for o in out]
 
@@ -270,6 +270,7 @@ def generate(model, toks, **kwargs):
     if use_vllm:
         return generate_with_vllm(model, toks, **kwargs)
     else:
+        model.eval()
         if model_name == "google/gemma-2-9b-it":
             return generate_with_sampling(model, toks, **kwargs)
         else:
@@ -279,7 +280,6 @@ def generate(model, toks, **kwargs):
 @torch.inference_mode()
 def eval_model_with_cot(model, tokenizer, reasoning_dataset, gen_params, batch_size=8):
     dataloader = DataLoader(reasoning_dataset, batch_size=batch_size, shuffle=False, collate_fn=partial(collate_fn_reasoning, tokenizer=tokenizer))
-    model.eval()
     correct = 0
     total = 0
     
@@ -298,10 +298,14 @@ def eval_model_with_cot(model, tokenizer, reasoning_dataset, gen_params, batch_s
     for i, batch in enumerate(dataloader):
         tokens, answers = batch
         seq_len = tokens.shape[1]
+        use_vllm = gen_params.get("use_vllm", False)
         out = generate(model, tokens, **gen_params)
         
         # Get model predictions and responses
-        responses = [tokenizer.decode(out[j, seq_len:].cpu()) for j in range(len(out))]
+        if use_vllm:
+            responses = [tokenizer.decode(out[j].cpu()) for j in range(len(out))]
+        else:
+            responses = [tokenizer.decode(out[j, seq_len:].cpu()) for j in range(len(out))]
         preds = [parse_response(response) for response in responses]
         
         # Log predictions and responses
