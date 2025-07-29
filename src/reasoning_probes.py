@@ -658,6 +658,7 @@ def eval_with_steering(model, residuals_dataset, layer, coefficient, probe_direc
                 matched += 1
             total += 1
         wandb.log({"steering_table": table}, step=i)
+        wandb.log({"matched": matched, "total": total, "accuracy": matched / total}, step=i)
 
     logs['metrics'] = {
         'matched': matched,
