@@ -554,30 +554,93 @@ class NNsightExperimentRunner:
             return False
 
         # Generate new predictions with ACE debiasing on test prompts
-        # Note: For nnsight, we'd need to implement ACE debiasing with nnsight
-        # For now, fall back to noting this needs implementation
-        self.logger.warning("ACE debiasing generation with nnsight not yet implemented")
+        from nnsight_steering import generate_with_nnsight_ace_debiasing
         
-        # Placeholder evaluation results
+        self.logger.info(f"Generating debiased predictions for {len(test_results)} test samples...")
+        
+        debiased_results = []
+        original_correct = 0
+        debiased_correct = 0
+        
+        for i, result in enumerate(test_results):
+            prompt_string = result["prompt_string"] 
+            correct_answer = result["correct_answer"]
+            original_pred = result["pred_answer"]
+            
+            # Track original accuracy
+            if original_pred.lower() == correct_answer.lower():
+                original_correct += 1
+            
+            # Convert prompt to tokens
+            prompt_tokens = model.to_tokens(prompt_string)
+            
+            # Generate with ACE debiasing
+            try:
+                debiased_generation = generate_with_nnsight_ace_debiasing(
+                    model=model,
+                    tokens=prompt_tokens,
+                    ace_unit_direction=ace_vectors.unit_direction,
+                    ace_bias=ace_vectors.bias,
+                    layer=best_layer,
+                    max_new_tokens=config.max_new_tokens,
+                    temperature=config.temperature
+                )
+                
+                # Parse debiased response  
+                debiased_pred, _ = self.parse_response(debiased_generation)
+                
+                # Track debiased accuracy
+                if debiased_pred.lower() == correct_answer.lower():
+                    debiased_correct += 1
+                
+                debiased_results.append({
+                    "prompt": prompt_string,
+                    "original_pred": original_pred,
+                    "debiased_generation": debiased_generation,
+                    "debiased_pred": debiased_pred,
+                    "correct_answer": correct_answer,
+                    "original_correct": original_pred.lower() == correct_answer.lower(),
+                    "debiased_correct": debiased_pred.lower() == correct_answer.lower()
+                })
+                
+            except Exception as e:
+                self.logger.warning(f"Failed to generate debiased response for sample {i}: {e}")
+                debiased_results.append({
+                    "prompt": prompt_string,
+                    "original_pred": original_pred,
+                    "debiased_generation": "",
+                    "debiased_pred": "",
+                    "correct_answer": correct_answer,
+                    "original_correct": original_pred.lower() == correct_answer.lower(),
+                    "debiased_correct": False
+                })
+        
+        # Compute final accuracy metrics
         n_samples = len(test_results)
-        original_correct = sum(1 for r in test_results if r["pred_answer"].lower() == r["correct_answer"].lower())
         original_accuracy = original_correct / n_samples if n_samples > 0 else 0
+        debiased_accuracy = debiased_correct / n_samples if n_samples > 0 else 0
+        
+        # Count prediction changes
+        prediction_changes = sum(
+            1 for r in debiased_results 
+            if r["original_pred"].lower() != r["debiased_pred"].lower() and r["debiased_pred"] != ""
+        )
         
         evaluation_results = {
             "original_accuracy": float(original_accuracy),
-            "debiased_accuracy": float(original_accuracy),  # Placeholder - no actual debiasing yet
-            "accuracy_change": 0.0,
-            "prediction_changes": 0,
-            "prediction_change_rate": 0.0,
+            "debiased_accuracy": float(debiased_accuracy), 
+            "accuracy_change": float(debiased_accuracy - original_accuracy),
+            "prediction_changes": prediction_changes,
+            "prediction_change_rate": prediction_changes / n_samples if n_samples > 0 else 0,
             "total_samples": n_samples,
-            "successful_generations": 0  # No debiased generations yet
+            "successful_generations": sum(1 for r in debiased_results if r["debiased_pred"] != "")
         }
         
         # Save debiasing results
         debiasing_results = {
             "ace_vectors": ace_vectors.to_dict(),
             "evaluation": evaluation_results,
-            "debiased_generations": [],  # Empty for now since nnsight implementation pending
+            "debiased_generations": debiased_results,
             "layer": best_layer,
             "n_train_samples": len(train_layer_activations),
             "n_test_samples": n_samples
@@ -600,7 +663,9 @@ class NNsightExperimentRunner:
         
         self.logger.info(f"ACE debiasing completed for layer {best_layer}")
         self.logger.info(f"Original accuracy: {evaluation_results['original_accuracy']:.1%}")
-        self.logger.info(f"Note: Debiased generation with nnsight not yet implemented")
+        self.logger.info(f"Debiased accuracy: {evaluation_results['debiased_accuracy']:.1%}")
+        self.logger.info(f"Accuracy change: {evaluation_results['accuracy_change']:+.1%}")
+        self.logger.info(f"Predictions changed: {evaluation_results['prediction_changes']}/{evaluation_results['total_samples']} ({evaluation_results['prediction_change_rate']:.1%})")
         
         return True
 
