@@ -19,6 +19,9 @@ from experiment_runner import EnhancedExperimentRunner
 from nnsight_experiment_runner import NNsightExperimentRunner
 from model_factory import get_recommended_backend
 
+from dotenv import load_dotenv
+load_dotenv()
+
 
 def create_parser() -> argparse.ArgumentParser:
     """Create the command-line argument parser."""
