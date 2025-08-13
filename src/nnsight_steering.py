@@ -56,7 +56,6 @@ def generate_with_nnsight_steering(
     steering_tensors = {
         layer: torch.tensor(
             steering_vectors[layer], 
-            device=tokens.device,
             dtype=model.dtype
         )
         for layer in layers
@@ -76,7 +75,7 @@ def generate_with_nnsight_steering(
             # Apply steering to each layer
             for i, layer in enumerate(layers):
                 layer_output = model.model.model.layers[layer].output
-                steering_vec = steering_tensors_list[i]
+                steering_vec = steering_tensors_list[i].to(layer_output.device)
                 
                 # Add steering vector to the last position
                 # Note: layer_output shape is [batch, seq_len, hidden]
