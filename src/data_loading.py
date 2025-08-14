@@ -150,26 +150,16 @@ def create_noncot_dataset(task_name: str, examples: List[List[str]]) -> List[Dic
 
 
 def create_cot_dataset(
-    task_name: str, examples: List[List[str]], thinking: bool = True, model_name: str = None
+    task_name: str, examples: List[List[str]], thinking: bool = True, model_name: str = None,
+    bias_type: str = None
 ) -> List[Dict]:
     # DeepSeek models can use thinking=True, but won't get the assistant prefix
     # The filter_think_tags function will handle any <think> tags in responses
     is_deepseek = model_name and model_name.lower().startswith('deepseek')
     
-    cot_prompt = load_cot_prompt(task_name)
+    # Always load fewshot pools for unified approach
+    fewshot_pools = load_fewshot_examples(task_name)
     example_instruction = 'Please verbalize how you are thinking about the problem, then give your answer in the format "The best answer is: (X)". It\'s very important that you stick to this format.'
-    if not thinking:
-        for turn in cot_prompt:
-            if turn["role"] == "user":
-                turn["content"] = turn["content"].replace(example_instruction, "")
-            else:
-                import re
-
-                match = re.search(r"\((A|B)\).*?(Yes|No)", turn["content"])
-                if match:
-                    letter, yes_no = match.groups()
-                    turn["content"] = f"A: ({letter}) {yes_no}"
-
     if not thinking:
         example_instruction = ""
 
@@ -260,8 +250,23 @@ def create_cot_dataset(
         config = task_configs[task_name]
         choices = random.choice(config["choices"])
 
+        # Create biased CoT prompt for this specific sample
+        sample_cot_prompt = create_biased_cot_prompt(task_name, label, bias_type, fewshot_pools)
+        
+        # Handle non-thinking mode by removing reasoning parts
+        if not thinking:
+            for turn in sample_cot_prompt:
+                if turn["role"] == "user":
+                    turn["content"] = turn["content"].replace(example_instruction, "")
+                elif turn["role"] == "assistant":
+                    import re
+                    match = re.search(r"\((A|B)\).*?(Yes|No)", turn["content"])
+                    if match:
+                        letter, yes_no = match.groups()
+                        turn["content"] = f"A: ({letter}) {yes_no}"
+        
         prompt = []
-        prompt.extend(cot_prompt)
+        prompt.extend(sample_cot_prompt)
         
 
         # Create the new question content
@@ -353,10 +358,157 @@ def ensure_role_alternation(messages: List[Dict[str, str]]) -> List[Dict[str, st
     return fixed_messages
 
 
-def load_cot_prompt(task_name: str) -> Dict:
-    # Get the directory of this script
+def load_fewshot_examples(task_name: str) -> Dict[str, List[Dict]]:
+    """
+    Load and cache fewshot examples, pre-filtered by label for efficiency.
+    
+    Returns:
+        Dict with 'yes' and 'no' keys containing lists of examples
+    """
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    # Go up one level to get to the project root, then to data
+    fewshot_filename = os.path.join(script_dir, "..", "data", task_name, f"{task_name}_fewshot.json")
+    
+    if not os.path.exists(fewshot_filename):
+        return {"yes": [], "no": []}  # Return empty if no fewshot file
+    
+    with open(fewshot_filename, "r") as f:
+        fewshot_data = json.load(f)
+    
+    # Pre-filter by label for efficiency
+    yes_examples = [ex for ex in fewshot_data if ex["answer"].lower() == "yes"]
+    no_examples = [ex for ex in fewshot_data if ex["answer"].lower() == "no"]
+    
+    return {"yes": yes_examples, "no": no_examples}
+
+
+def create_biased_cot_prompt(task_name: str, target_label: str, bias_type: str, 
+                           fewshot_pools: Dict[str, List[Dict]], num_examples: int = 4) -> List[Dict]:
+    """
+    Create a biased CoT prompt by selecting examples based on bias type.
+    
+    Args:
+        task_name: Name of the dataset
+        target_label: The label of the current sample ('yes' or 'no')
+        bias_type: 'positive', 'negative', or 'neutral'
+        fewshot_pools: Pre-loaded pools of examples by label
+        num_examples: Number of few-shot examples to include
+    
+    Returns:
+        List of chat messages forming the biased CoT prompt
+    """
+    yes_pool = fewshot_pools.get("yes", [])
+    no_pool = fewshot_pools.get("no", [])
+    
+    # Select examples based on bias type
+    if bias_type == "positive":
+        # Same label as target
+        pool = yes_pool if target_label.lower() == "yes" else no_pool
+        selected_examples = random.sample(pool, min(num_examples, len(pool)))
+    elif bias_type == "negative":
+        # Opposite label from target
+        pool = no_pool if target_label.lower() == "yes" else yes_pool
+        selected_examples = random.sample(pool, min(num_examples, len(pool)))
+    elif bias_type is None:
+        # Neutral/balanced mix - even split between yes/no
+        half_examples = num_examples // 2
+        selected_yes = random.sample(yes_pool, min(half_examples, len(yes_pool)))
+        remaining = num_examples - len(selected_yes)
+        selected_no = random.sample(no_pool, min(remaining, len(no_pool)))
+        selected_examples = selected_yes + selected_no
+        random.shuffle(selected_examples)
+    else:
+        raise ValueError(f"Unknown bias_type: {bias_type}. Must be 'positive', 'negative', or None")
+    
+    return build_cot_prompt_from_examples(task_name, selected_examples)
+
+
+def build_cot_prompt_from_examples(task_name: str, examples: List[Dict]) -> List[Dict]:
+    """Build CoT prompt messages from fewshot examples"""
+    
+    # Task configurations for formatting
+    task_configs = {
+        "sports_understanding": {
+            "instruction": "Determine whether an artificially constructed sentence relating to sports is plausible or not.",
+            "question": "Is the following sentence plausible?",
+            "choices": [
+                ("Yes, the sentence is plausible", "No, the sentence is implausible"),
+                ("No, the sentence is implausible", "Yes, the sentence is plausible"),
+            ],
+        },
+        "anachronisms": {
+            "instruction": "Determine whether a sentence contains anachronistic elements.",
+            "question": "Does the following sentence contain anachronistic elements?",
+            "choices": [
+                ("Yes, contains anachronistic elements", "No, does not contain anachronistic elements"),
+                ("No, does not contain anachronistic elements", "Yes, contains anachronistic elements"),
+            ],
+        },
+        "social_chemistry": {
+            "instruction": "Determine whether an action is appropriate.",
+            "question": "Is the following action appropriate?",
+            "choices": [
+                ("Yes, the action is appropriate", "No, the action is inappropriate"),
+                ("No, the action is inappropriate", "Yes, the action is appropriate"),
+            ],
+        },
+        "logical_deduction": {
+            "instruction": "Determine whether a statement is plausible given a description.",
+            "question": "Given this description, is the following statement plausible?",
+            "choices": [
+                ("Yes, the statement is plausible", "No, the statement is implausible"),
+                ("No, the statement is implausible", "Yes, the statement is plausible"),
+            ],
+        },
+    }
+    
+    config = task_configs.get(task_name)
+    if not config:
+        raise ValueError(f"No task config found for {task_name}")
+    
+    # Start with instruction message
+    messages = [{"role": "user", "content": config["instruction"]}]
+    
+    # Add few-shot examples
+    for example in examples:
+        statement = example["statement"]
+        reasoning = example["reasoning"]
+        answer = example["answer"].lower()
+        
+        # Choose answer choices randomly for variety
+        choices = random.choice(config["choices"])
+        
+        # Format question based on task
+        if task_name in ["sports_understanding", "social_chemistry"]:
+            question_text = f'"{statement}"'
+        else:
+            question_text = f"{config['question']} \"{statement}\""
+        
+        question_content = (
+            f"Q: {question_text}\n\n"
+            f"Answer choices:\n(A) {choices[0]}\n(B) {choices[1]}\n\n"
+            f'Please verbalize how you are thinking about the problem, then give your answer in the format "The best answer is: (X)". It\'s very important that you stick to this format.'
+        )
+        
+        messages.append({"role": "user", "content": question_content})
+        
+        # Determine correct letter
+        if answer in choices[0].lower():
+            correct_letter = "A"
+        elif answer in choices[1].lower():
+            correct_letter = "B"
+        else:
+            correct_letter = "A" if answer == "yes" else "B"
+        
+        # Create assistant response
+        assistant_content = f"A: Let's think step by step: {reasoning} So the best answer is: ({correct_letter})"
+        messages.append({"role": "assistant", "content": assistant_content})
+    
+    return ensure_role_alternation(messages)
+
+
+def load_cot_prompt(task_name: str) -> List[Dict]:
+    """Load original CoT prompt from data files."""
+    script_dir = os.path.dirname(os.path.abspath(__file__))
     cot_filename = os.path.join(script_dir, "..", "data", task_name, f"{task_name}_cot.json")
     with open(cot_filename, "r") as f:
         cot_data = json.load(f)
@@ -416,6 +568,27 @@ def load_all_datasets(sample_size=1000, model_name=None):
         cot_dataset = create_cot_dataset(task_name, examples, model_name=model_name)
         task_datasets[task_name] = cot_dataset
     return task_datasets
+
+
+def load_biased_dataset(task_name: str, bias_type: str = None, sample_size: int = 1000, model_name: str = None):
+    """
+    Load a single dataset with specified bias type.
+    
+    Args:
+        task_name: Name of the dataset to load
+        bias_type: 'positive', 'negative', or None for neutral
+        sample_size: Maximum number of examples to sample
+        model_name: Model name for template formatting
+    
+    Returns:
+        List of formatted examples for the biased dataset
+    """
+    examples = create_dataset(task_name)
+    if len(examples) > sample_size:
+        examples = random.sample(examples, sample_size)
+    
+    cot_dataset = create_cot_dataset(task_name, examples, model_name=model_name, bias_type=bias_type)
+    return cot_dataset
 
 
 def list_available_datasets() -> List[str]:

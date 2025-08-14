@@ -94,6 +94,75 @@ class EnhancedExperimentRunner:
     def parse_response(self, response: str) -> Tuple[str, str]:
         """Parse model response to extract answer."""
         return parse_response(response, thinking=True)
+    
+    def _load_biased_train_test_split(self, config: ExperimentConfig) -> Tuple[List[Dict], List[Dict]]:
+        """Load train and test datasets with proper bias handling and no overlap."""
+        from data_loading import create_dataset, create_cot_dataset
+        
+        # Determine train and test dataset names
+        train_dataset_name = getattr(config, 'train_dataset', None) or config.dataset_name.split("->")[0] if "->" in config.dataset_name else config.dataset_name
+        test_dataset_name = getattr(config, 'test_dataset', None) or config.dataset_name.split("->")[1] if "->" in config.dataset_name else config.dataset_name
+        
+        train_bias = getattr(config, 'train_bias', None)
+        test_bias = getattr(config, 'test_bias', None)
+        
+        if train_dataset_name == test_dataset_name:
+            # Same dataset: load raw examples, split, then create biased CoT datasets
+            self.logger.info(f"Loading same dataset with different biases: {train_dataset_name}")
+            
+            # Load raw examples
+            raw_examples = create_dataset(train_dataset_name)
+            
+            # Split raw examples to ensure no overlap
+            train_examples, test_examples = train_test_split(
+                raw_examples,
+                train_size=config.train_size,
+                test_size=config.test_size,
+                random_state=config.split_seed,
+            )
+            
+            # Create biased CoT datasets for each split
+            self.logger.info(f"Creating train dataset with bias: {train_bias}")
+            train_dataset = create_cot_dataset(
+                train_dataset_name, 
+                train_examples, 
+                model_name=config.model_name,
+                bias_type=train_bias
+            )
+            
+            self.logger.info(f"Creating test dataset with bias: {test_bias}")
+            test_dataset = create_cot_dataset(
+                test_dataset_name,
+                test_examples,
+                model_name=config.model_name, 
+                bias_type=test_bias
+            )
+            
+        else:
+            # Different datasets: load separately (no overlap concern)
+            self.logger.info(f"Loading cross-datasets: {train_dataset_name} -> {test_dataset_name}")
+            
+            from data_loading import load_biased_dataset
+            
+            self.logger.info(f"Loading train dataset: {train_dataset_name} with bias: {train_bias}")
+            full_train_dataset = load_biased_dataset(
+                train_dataset_name,
+                bias_type=train_bias,
+                sample_size=config.train_size,
+                model_name=config.model_name
+            )
+            train_dataset = full_train_dataset[:config.train_size]
+            
+            self.logger.info(f"Loading test dataset: {test_dataset_name} with bias: {test_bias}")
+            full_test_dataset = load_biased_dataset(
+                test_dataset_name,
+                bias_type=test_bias,
+                sample_size=config.test_size,
+                model_name=config.model_name
+            )
+            test_dataset = full_test_dataset[:config.test_size]
+        
+        return train_dataset, test_dataset
 
     def batch_get_resid_activations(self, prompts: List[str], model: ChatModel):
         """Get residual stream activations for a batch of prompts with memory optimization."""
@@ -247,31 +316,39 @@ class EnhancedExperimentRunner:
             f"Generating data for {config.model_name} on {config.dataset_name}"
         )
 
-        # Load or use cached dataset
-        if self.run_config.use_cache and cache.has_dataset():
-            dataset = cache.load_pickle(cache.get_dataset_path())
+        # Handle biased vs regular dataset loading
+        has_bias = hasattr(config, 'train_bias') and (config.train_bias or config.test_bias)
+        is_cross_dataset = hasattr(config, 'train_dataset') and config.train_dataset != config.test_dataset
+        
+        if has_bias or is_cross_dataset:
+            # For biased experiments: load train and test datasets separately
+            train_dataset, test_dataset = self._load_biased_train_test_split(config)
         else:
-            datasets = load_all_datasets(model_name=config.model_name)
-            dataset = datasets[config.dataset_name]
-            if self.run_config.use_cache:
-                cache.save_pickle(dataset, cache.get_dataset_path())
+            # Regular dataset loading with normal train/test split
+            if self.run_config.use_cache and cache.has_dataset():
+                dataset = cache.load_pickle(cache.get_dataset_path())
+            else:
+                datasets = load_all_datasets(model_name=config.model_name)
+                dataset = datasets[config.dataset_name]
+                if self.run_config.use_cache:
+                    cache.save_pickle(dataset, cache.get_dataset_path())
 
-        # Load or create train/test split
-        if self.run_config.use_cache and cache.has_train_test_split():
-            train_dataset, test_dataset = cache.load_pickle(
-                cache.get_train_test_split_path()
-            )
-        else:
-            train_dataset, test_dataset = train_test_split(
-                dataset,
-                train_size=config.train_size,
-                test_size=config.test_size,
-                random_state=config.split_seed,
-            )
-            if self.run_config.use_cache:
-                cache.save_pickle(
-                    (train_dataset, test_dataset), cache.get_train_test_split_path()
+            # Load or create train/test split
+            if self.run_config.use_cache and cache.has_train_test_split():
+                train_dataset, test_dataset = cache.load_pickle(
+                    cache.get_train_test_split_path()
                 )
+            else:
+                train_dataset, test_dataset = train_test_split(
+                    dataset,
+                    train_size=config.train_size,
+                    test_size=config.test_size,
+                    random_state=config.split_seed,
+                )
+                if self.run_config.use_cache:
+                    cache.save_pickle(
+                        (train_dataset, test_dataset), cache.get_train_test_split_path()
+                    )
         
         # Log data label distributions
         train_labels = [item["correct_answer"] for item in train_dataset]

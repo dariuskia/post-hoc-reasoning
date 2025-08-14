@@ -26,6 +26,14 @@ class DatasetConfig:
     train_size: int = 200
     test_size: int = 800
     split_seed: int = 42
+    
+    # Bias experiment parameters
+    train_bias: Optional[str] = None  # "positive", "negative", or None
+    test_bias: Optional[str] = None   # "positive", "negative", or None
+    
+    # Cross-dataset experiment parameters  
+    train_dataset: Optional[str] = None  # If specified, use different dataset for training
+    test_dataset: Optional[str] = None   # If specified, use different dataset for testing
 
 
 @dataclass
@@ -58,6 +66,10 @@ class ExperimentRunConfig:
     evaluate_confabulation: bool = (
         False  # Whether to use GPT-4 for confabulation analysis
     )
+    
+    # Experiment type flags
+    bias_evaluation: bool = True  # Measure accuracy under different bias conditions
+    cross_bias_debiasing: bool = True  # ACE cross-bias experiments
 
 
 class ConfigValidator:
@@ -98,10 +110,20 @@ class ConfigValidator:
             from data_loading import list_available_datasets
 
             available = list_available_datasets()
-            if config.name not in available:
-                errors.append(
-                    f"Dataset '{config.name}' not available. Available: {available}"
-                )
+            
+            # Handle cross-dataset names like "dataset1->dataset2"
+            if "->" in config.name:
+                train_dataset = config.train_dataset or config.name.split("->")[0]
+                test_dataset = config.test_dataset or config.name.split("->")[1]
+                if train_dataset not in available:
+                    errors.append(f"Train dataset '{train_dataset}' not available. Available: {available}")
+                if test_dataset not in available:
+                    errors.append(f"Test dataset '{test_dataset}' not available. Available: {available}")
+            else:
+                # Regular single dataset validation
+                dataset_to_check = config.train_dataset or config.test_dataset or config.name
+                if dataset_to_check not in available:
+                    errors.append(f"Dataset '{dataset_to_check}' not available. Available: {available}")
         except ImportError:
             # If we can't import, just warn
             pass
@@ -245,6 +267,10 @@ class ConfigLoader:
                         train_size=dataset_data.get("train_size", 200),
                         test_size=dataset_data.get("test_size", 800),
                         split_seed=dataset_data.get("split_seed", 42),
+                        train_bias=dataset_data.get("train_bias"),
+                        test_bias=dataset_data.get("test_bias"),
+                        train_dataset=dataset_data.get("train_dataset"),
+                        test_dataset=dataset_data.get("test_dataset"),
                     )
                 )
             else:
@@ -370,15 +396,28 @@ def create_experiment_configs(
     for model in run_config.models:
         for dataset in run_config.datasets:
             for steering_method in steering_methods:
+                # Handle cross-dataset experiments
+                actual_dataset_name = dataset.name
+                train_dataset = dataset.train_dataset or dataset.name
+                test_dataset = dataset.test_dataset or dataset.name
+                
+                # For cross-dataset experiments, use a combined name
+                if dataset.train_dataset or dataset.test_dataset:
+                    actual_dataset_name = f"{train_dataset}->{test_dataset}"
+                
                 exp_config = ExperimentConfig(
                     model_name=model.name,
-                    dataset_name=dataset.name,
+                    dataset_name=actual_dataset_name,
                     train_size=dataset.train_size,
                     test_size=dataset.test_size,
                     split_seed=dataset.split_seed,
                     alpha_range=run_config.steering.alpha_range,
                     temperature=run_config.steering.temperature,
                     max_new_tokens=run_config.steering.max_new_tokens,
+                    train_bias=dataset.train_bias,
+                    test_bias=dataset.test_bias,
+                    train_dataset=train_dataset,
+                    test_dataset=test_dataset,
                 )
                 # Store steering method for later access
                 exp_config.steering_method = steering_method

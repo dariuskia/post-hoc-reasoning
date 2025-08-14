@@ -20,6 +20,12 @@ class ExperimentConfig:
     alpha_range: List[float]
     temperature: float = 0.7
     max_new_tokens: int = 100
+    
+    # Bias experiment parameters
+    train_bias: Optional[str] = None
+    test_bias: Optional[str] = None
+    train_dataset: Optional[str] = None  # For cross-dataset experiments
+    test_dataset: Optional[str] = None
 
     def get_hash(self) -> str:
         """Generate a unique hash for this experiment configuration."""
@@ -27,7 +33,8 @@ class ExperimentConfig:
         # Only include core experiment parameters that affect data generation
         config_str = (
             f"{self.model_name}_{self.dataset_name}_{self.train_size}_{self.test_size}_"
-            f"{self.split_seed}_{self.temperature}_{self.max_new_tokens}"
+            f"{self.split_seed}_{self.temperature}_{self.max_new_tokens}_"
+            f"{self.train_bias}_{self.test_bias}_{self.train_dataset}_{self.test_dataset}"
         )
         return hashlib.md5(config_str.encode()).hexdigest()[:12]
 
