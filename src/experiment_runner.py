@@ -91,9 +91,10 @@ class EnhancedExperimentRunner:
         # Use our custom logging setup
         self.logger = setup_logging(log_file=log_file, verbose=True)
 
-    def parse_response(self, response: str) -> Tuple[str, str]:
+    def parse_response(self, response: str, prompt_context: str = "") -> Tuple[str, str]:
         """Parse model response to extract answer."""
-        return parse_response(response, thinking=True)
+        return parse_response(response, thinking=True, prompt_context=prompt_context, 
+                            use_judge=self.run_config.use_judge, task_config=None)
     
     def _load_biased_train_test_split(self, config: ExperimentConfig) -> Tuple[List[Dict], List[Dict]]:
         """Load train and test datasets with proper bias handling and no overlap."""
@@ -281,7 +282,7 @@ class EnhancedExperimentRunner:
         )
         generations = [gen[len(prompt) :] for gen, prompt in zip(generations, prompts)]
 
-        responses = [self.parse_response(response) for response in generations]
+        responses = [self.parse_response(response, prompt) for response, prompt in zip(generations, prompts)]
         pred_letters, pred_answers = zip(*responses)
 
         corrects = [
@@ -1041,7 +1042,7 @@ class EnhancedExperimentRunner:
                 )
                 
                 # Parse debiased response  
-                debiased_pred, _ = self.parse_response(debiased_generation)
+                debiased_pred, _ = self.parse_response(debiased_generation, prompt_string)
                 
                 # Track debiased accuracy
                 if debiased_pred.lower() == correct_answer.lower():
@@ -1214,7 +1215,7 @@ class EnhancedExperimentRunner:
                     # Clean up tokens immediately
                     del example_tokens
 
-                new_letter, new_answer = self.parse_response(generation)
+                new_letter, new_answer = self.parse_response(generation, example_prompt)
                 orig = example["pred_answer"]
                 
                 # Clean up generation display - handle list

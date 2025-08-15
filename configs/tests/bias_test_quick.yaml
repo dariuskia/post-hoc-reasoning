@@ -29,6 +29,9 @@ steering:
 bias_evaluation: true
 cross_bias_debiasing: true
 
+# Parsing configuration
+use_judge: true  # Use LLM judge for parsing
+
 use_cache: true
 save_generations: true
 evaluate_confabulation: false

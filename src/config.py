@@ -70,6 +70,9 @@ class ExperimentRunConfig:
     # Experiment type flags
     bias_evaluation: bool = True  # Measure accuracy under different bias conditions
     cross_bias_debiasing: bool = True  # ACE cross-bias experiments
+    
+    # Parsing configuration
+    use_judge: bool = False  # Use LLM judge for parsing responses
 
 
 class ConfigValidator:

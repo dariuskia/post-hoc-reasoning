@@ -2,7 +2,10 @@
 Consolidated parsing utilities for model responses.
 """
 import re
-from typing import Tuple, Union, List
+import json
+from typing import Tuple, Union, List, Dict, Optional
+from pydantic import BaseModel
+from openai import OpenAI
 
 
 def filter_think_tags(response: str) -> str:
@@ -95,19 +98,114 @@ def parse_deepseek_response(response: Union[str, List[str]]) -> Tuple[str, str]:
     return letter, text_answer
 
 
-def parse_response(response: Union[str, List[str]], thinking: bool = True) -> Tuple[str, str]:
+class ParsedResponse(BaseModel):
+    answer: str
+    letter: str
+
+
+def parse_response_with_judge(task_config: Optional[Dict], response: str) -> Tuple[str, str]:
+    """
+    Parse model response using an LLM judge to extract answer and letter.
+    
+    Args:
+        task_config: Task configuration containing choices mapping
+        response: Raw model response
+        
+    Returns:
+        Tuple of (letter, text_answer) extracted by judge
+    """
+    client = OpenAI()
+    
+    # Build prompt based on task config if available
+    if task_config and 'choices' in task_config:
+        choice_mapping = task_config['choices']
+        prompt = f"You are a helpful assistant. Given the following response, where the predicted answer should be at the end of the response, extract both the letter of the answer (either 'A' or 'B') and the predicted answer as 'yes' or 'no', which is 'yes' if the model responds with {choice_mapping[0][0]}, and 'no' if the model responds with {choice_mapping[0][1]}. If it is unclear, you should extract the letter and answer as empty strings \"\"."
+    else:
+        # Fallback prompt for general cases
+        prompt = "You are a helpful assistant. Given the following response, extract both the letter of the answer (either 'A' or 'B') and the predicted answer as 'yes' or 'no'. Look for patterns like '(A)', '(B)', and determine if the answer means 'yes' (positive/plausible/true) or 'no' (negative/implausible/false). If it is unclear, extract the letter and answer as empty strings \"\"."
+    
+    chat = [
+        {"role": "system", "content": prompt},
+        {"role": "user", "content": response}
+    ]
+    
+    try:
+        api_response = client.beta.chat.completions.parse(
+            model="gpt-4o-mini",
+            messages=chat,
+            response_format=ParsedResponse,
+        )
+        obj = json.loads(api_response.choices[0].message.content)
+        return obj['letter'], obj['answer']
+    except Exception as e:
+        # Fallback to regular parsing if judge fails
+        return parse_response(response)
+
+
+def infer_missing_from_choices(letter: str, text_answer: str, prompt_context: str) -> Tuple[str, str]:
+    """
+    Infer missing letter or answer from available choices in prompt context.
+    
+    Args:
+        letter: Extracted letter ('A', 'B', or empty)
+        text_answer: Extracted text answer ('yes', 'no', or empty)
+        prompt_context: Full prompt context containing answer choices
+        
+    Returns:
+        Tuple of (letter, text_answer) with missing values inferred
+    """
+    # Extract choices from prompt context
+    choice_a_match = re.search(r'\(A\)\s*([^\n\(]+)', prompt_context, re.IGNORECASE)
+    choice_b_match = re.search(r'\(B\)\s*([^\n\(]+)', prompt_context, re.IGNORECASE)
+    
+    choice_a_text = choice_a_match.group(1).strip() if choice_a_match else ""
+    choice_b_text = choice_b_match.group(1).strip() if choice_b_match else ""
+    
+    # Determine yes/no mapping for choices
+    a_is_yes = ("yes" in choice_a_text.lower() or "plausible" in choice_a_text.lower() or 
+                "true" in choice_a_text.lower() or "contains" in choice_a_text.lower())
+    b_is_yes = ("yes" in choice_b_text.lower() or "plausible" in choice_b_text.lower() or 
+                "true" in choice_b_text.lower() or "contains" in choice_b_text.lower())
+    
+    # If we have letter but missing answer
+    if letter and not text_answer:
+        if letter.upper() == 'A':
+            text_answer = "yes" if a_is_yes else "no"
+        elif letter.upper() == 'B':
+            text_answer = "yes" if b_is_yes else "no"
+    
+    # If we have answer but missing letter
+    elif text_answer and not letter:
+        if text_answer.lower() == "yes":
+            letter = "A" if a_is_yes else "B"
+        elif text_answer.lower() == "no":
+            letter = "A" if not a_is_yes else "B"
+    
+    return letter, text_answer
+
+
+def parse_response(response: Union[str, List[str]], thinking: bool = True, 
+                  prompt_context: str = "", use_judge: bool = False, 
+                  task_config: Optional[Dict] = None) -> Tuple[str, str]:
     """
     Parse model response to extract answer letter and text.
     
     Args:
         response: Raw model response string or list of strings
         thinking: Whether the response includes reasoning (default True)
+        prompt_context: Full prompt context for inferring missing values
+        use_judge: Whether to use LLM judge for parsing
+        task_config: Task configuration for judge parsing
         
     Returns:
         Tuple of (letter, text_answer) where:
         - letter: The choice letter (A, B, etc.) or empty string if not found
         - text_answer: The text answer or empty string if not found
     """
+    # Use judge-based parsing if requested
+    if use_judge:
+        return parse_response_with_judge(task_config, response)
+    
     # Handle list input - take the first element
     if isinstance(response, list):
         if len(response) == 0:
@@ -166,5 +264,9 @@ def parse_response(response: Union[str, List[str]], thinking: bool = True) -> Tu
         .strip()
         .lower()
     )
+    
+    # Apply robustification logic if we have prompt context and missing values
+    if prompt_context and (not letter or not text_answer):
+        letter, text_answer = infer_missing_from_choices(letter, text_answer, prompt_context)
     
     return letter, text_answer

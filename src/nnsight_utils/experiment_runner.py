@@ -83,11 +83,12 @@ class UnifiedExperimentRunner:
         )
         self.logger = logging.getLogger("UnifiedExperimentRunner")
 
-    def parse_response(self, response: str, model_name: Optional[str] = None) -> Tuple[str, str]:
+    def parse_response(self, response: str, model_name: Optional[str] = None, prompt_context: str = "") -> Tuple[str, str]:
         """Parse model response to extract answer."""
         # Use the same parser for all models now, including DeepSeek
         # DeepSeek will use thinking=True prompts and the standard parser
-        return parse_response(response, thinking=True)
+        return parse_response(response, thinking=True, prompt_context=prompt_context, 
+                            use_judge=self.run_config.use_judge, task_config=None)
 
     def batch_get_generations(
         self, 
@@ -219,7 +220,7 @@ class UnifiedExperimentRunner:
                 if hasattr(model, 'model_name') and model.model_name.lower().startswith('deepseek'):
                     response_to_parse = filter_think_tags(generation)
                 
-                pred_letter, pred_answer = self.parse_response(response_to_parse, model.model_name)
+                pred_letter, pred_answer = self.parse_response(response_to_parse, model.model_name, item["prompt"])
                 train_results.append({
                     "prompt": item["prompt"],
                     "response": generation,
@@ -284,7 +285,7 @@ class UnifiedExperimentRunner:
                 if hasattr(model, 'model_name') and model.model_name.lower().startswith('deepseek'):
                     response_to_parse = filter_think_tags(generation)
                 
-                pred_letter, pred_answer = self.parse_response(response_to_parse, model.model_name)
+                pred_letter, pred_answer = self.parse_response(response_to_parse, model.model_name, item["prompt"])
                 test_results.append({
                     "prompt": item["prompt"],
                     "response": generation,
@@ -691,7 +692,7 @@ class UnifiedExperimentRunner:
                 response_to_parse = filter_think_tags(steered_response)
             
             # Parse response
-            pred_letter, pred_answer = self.parse_response(response_to_parse)
+            pred_letter, pred_answer = self.parse_response(response_to_parse, prompt_context=example["prompt"])
             
             # Determine success and category
             target_answer = "no" if alpha < 0 else "yes"
@@ -944,7 +945,7 @@ class UnifiedExperimentRunner:
                 )
                 
                 # Parse debiased response  
-                debiased_pred, _ = self.parse_response(debiased_generation)
+                debiased_pred, _ = self.parse_response(debiased_generation, prompt_context=prompt_string)
                 
                 # Track debiased accuracy
                 if debiased_pred.lower() == correct_answer.lower():
