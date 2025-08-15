@@ -154,18 +154,19 @@ def infer_missing_from_choices(letter: str, text_answer: str, prompt_context: st
     Returns:
         Tuple of (letter, text_answer) with missing values inferred
     """
-    # Extract choices from prompt context
-    choice_a_match = re.search(r'\(A\)\s*([^\n\(]+)', prompt_context, re.IGNORECASE)
-    choice_b_match = re.search(r'\(B\)\s*([^\n\(]+)', prompt_context, re.IGNORECASE)
+    # Extract choices from prompt context - find the LAST occurrence to avoid few-shot examples
+    # Find all matches and take the last ones (for the actual question, not few-shot examples)
+    choice_a_matches = list(re.finditer(r'\(A\)\s*([^\n\(]+)', prompt_context, re.IGNORECASE))
+    choice_b_matches = list(re.finditer(r'\(B\)\s*([^\n\(]+)', prompt_context, re.IGNORECASE))
     
-    choice_a_text = choice_a_match.group(1).strip() if choice_a_match else ""
-    choice_b_text = choice_b_match.group(1).strip() if choice_b_match else ""
+    # Take the last match for each choice (the actual question being answered)
+    choice_a_text = choice_a_matches[-1].group(1).strip() if choice_a_matches else ""
+    choice_b_text = choice_b_matches[-1].group(1).strip() if choice_b_matches else ""
     
     # Determine yes/no mapping for choices
-    a_is_yes = ("yes" in choice_a_text.lower() or "plausible" in choice_a_text.lower() or 
-                "true" in choice_a_text.lower() or "contains" in choice_a_text.lower())
-    b_is_yes = ("yes" in choice_b_text.lower() or "plausible" in choice_b_text.lower() or 
-                "true" in choice_b_text.lower() or "contains" in choice_b_text.lower())
+    a_is_yes = "yes" in choice_a_text.lower()
+    b_is_yes = "yes" in choice_b_text.lower()
+    assert a_is_yes != b_is_yes, "A and B choices should have different answers"
     
     # If we have letter but missing answer
     if letter and not text_answer:

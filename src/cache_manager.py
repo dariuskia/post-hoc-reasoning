@@ -225,8 +225,8 @@ class ExperimentCache:
         else:
             # Check default/logistic regression probes
             return (
-                os.path.exists(self.get_probes_path())
-                and os.path.exists(self.get_probe_coefficients_path())
+                # os.path.exists(self.get_probes_path())
+                os.path.exists(self.get_probe_coefficients_path())
                 and os.path.exists(self.get_auc_scores_path())
             )
 

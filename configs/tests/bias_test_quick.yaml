@@ -8,22 +8,25 @@ datasets:
   test_size: 20          # Small for quick test
   train_size: 20         # Small for quick test
   train_bias: positive   # Train ACE on positive bias
-  test_bias: negative    # Test on negative bias
+  test_bias: positive    # Test on positive bias
 
 models:
 - backend: auto
-  batch_size: 2
+  batch_size: 10
   device: auto
   dtype: bfloat16
   name: google/gemma-2-2b-it  # Small model for speed
 
 steering:
   alpha_range:
-  - 2                    # Just one alpha for quick test
+  - 2
+  - 4
+  - 6
+  - 8
   max_new_tokens: 100    # Shorter generations
   temperature: 0.7
   method: caa-single-layer
-  max_gen: 5             # Only 5 steering examples per direction
+  # max_gen: 5             # Only 5 steering examples per direction
 
 # Experiment type flags
 bias_evaluation: true

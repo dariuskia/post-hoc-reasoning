@@ -381,7 +381,7 @@ def load_fewshot_examples(task_name: str) -> Dict[str, List[Dict]]:
     return {"yes": yes_examples, "no": no_examples}
 
 
-def create_biased_cot_prompt(task_name: str, target_label: str, bias_type: str, 
+def create_biased_cot_prompt(task_name: str, target_label: str, bias_type: str | None, 
                            fewshot_pools: Dict[str, List[Dict]], num_examples: int = 4) -> List[Dict]:
     """
     Create a biased CoT prompt by selecting examples based on bias type.

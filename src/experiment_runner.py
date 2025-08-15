@@ -6,6 +6,7 @@ import sys
 import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from functools import cache
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -91,10 +92,65 @@ class EnhancedExperimentRunner:
         # Use our custom logging setup
         self.logger = setup_logging(log_file=log_file, verbose=True)
 
+    @cache
+    def get_batch_size(self, model_name: str) -> int:
+        """Get batch size for a specific model from configuration (cached)."""
+        return next(
+            (
+                m.batch_size
+                for m in self.run_config.models
+                if m.name == model_name
+            ),
+            1,  # Default batch size
+        )
+    
     def parse_response(self, response: str, prompt_context: str = "") -> Tuple[str, str]:
         """Parse model response to extract answer."""
         return parse_response(response, thinking=True, prompt_context=prompt_context, 
                             use_judge=self.run_config.use_judge, task_config=None)
+    
+    def _log_debiasing_result(
+        self,
+        example_idx: int,
+        total_examples: int,
+        original_answer: str,
+        debiased_answer: str,
+        correct_answer: str,
+        response_text: str,
+        category: str,
+        model_name: str,
+        dataset_name: str,
+        original_correct: int,
+        debiased_correct: int,
+        prediction_changes: int,
+    ):
+        """Log debiasing result with nice formatting."""
+        # Category symbols and colors
+        category_symbols = {
+            "corrected": "✓ CORRECTED",
+            "correct_maintained": "✓ MAINTAINED", 
+            "degraded": "⚠ DEGRADED",
+            "still_incorrect": "✗ UNCHANGED",
+            "unparsed": "? UNPARSED",
+            "error": "❌ ERROR"
+        }
+        
+        symbol = category_symbols.get(category, "? UNKNOWN")
+        
+        # Calculate running rates
+        original_rate = original_correct / example_idx if example_idx > 0 else 0
+        debiased_rate = debiased_correct / example_idx if example_idx > 0 else 0
+        change_rate = prediction_changes / example_idx if example_idx > 0 else 0
+        
+        # Truncate response for display
+        display_response = response_text[:100] + "..." if len(response_text) > 100 else response_text
+        
+        self.logger.info(
+            f"DEBIASING {example_idx}/{total_examples}: "
+            f"{original_answer}→{debiased_answer} (correct: {correct_answer}) {symbol} | "
+            f"Orig: {original_rate:.2f}, Debias: {debiased_rate:.2f}, Changes: {change_rate:.2f} | "
+            f"Response: {display_response}"
+        )
     
     def _load_biased_train_test_split(self, config: ExperimentConfig) -> Tuple[List[Dict], List[Dict]]:
         """Load train and test datasets with proper bias handling and no overlap."""
@@ -361,14 +417,7 @@ class EnhancedExperimentRunner:
         self.logger.info(f"Test data labels: {test_distribution} (total: {len(test_dataset)})")
 
         
-        batch_size = next(
-            (
-                m.batch_size
-                for m in self.run_config.models
-                if m.name == config.model_name
-            ),
-            2,
-        )
+        batch_size = self.get_batch_size(config.model_name)
 
         # Process training data
         if not (self.run_config.use_cache and cache.has_generations()):
@@ -746,8 +795,8 @@ class EnhancedExperimentRunner:
         """
         from sklearn.metrics import roc_auc_score
         
-        if len(activations) == 0:
-            return 0.5  # Return random baseline for empty data
+        # if len(activations) == 0:
+        #     return 0.5  # Return random baseline for empty data
             
         activations_array = np.array(activations)
         labels_array = np.array(labels)
@@ -763,13 +812,9 @@ class EnhancedExperimentRunner:
             # If all labels are the same, return random baseline
             return 0.5
             
-        try:
-            # Compute AUC-ROC score
-            auc_score = roc_auc_score(binary_labels, similarities)
-            return auc_score
-        except ValueError:
-            # Handle edge cases
-            return 0.5
+        # Compute AUC-ROC score
+        auc_score = roc_auc_score(binary_labels, similarities)
+        return auc_score
 
     def run_steering_experiments(
         self, model: ChatModel, config: ExperimentConfig, cache: ExperimentCache
@@ -973,8 +1018,7 @@ class EnhancedExperimentRunner:
             self.logger.error("Missing probe AUC scores for debiasing")
             return False
         
-        best_layer = max(auc_scores.keys(), key=lambda k: auc_scores[k])
-        best_layer = int(best_layer)
+        best_layer = int(np.argmax(auc_scores))
         self.logger.info(f"Using layer {best_layer} for ACE debiasing (best probe layer)")
 
         # Prepare training data for ACE
@@ -998,7 +1042,9 @@ class EnhancedExperimentRunner:
             self.logger.info(f"ACE vectors computed and saved")
             
         except Exception as e:
+            import traceback
             self.logger.error(f"Failed to compute ACE vectors: {e}")
+            self.logger.error(traceback.format_exc())
             return False
 
         # Load test data for generating debiased responses
@@ -1008,67 +1054,158 @@ class EnhancedExperimentRunner:
             self.logger.error("Missing test generation data for debiasing evaluation")
             return False
 
-        # Generate new predictions with ACE debiasing on test prompts
+        # Generate debiased predictions on test prompts
         from utils import generate_with_ace_debiasing
         
         self.logger.info(f"Generating debiased predictions for {len(test_results)} test samples...")
         
+        # Get batch size from config
+        batch_size = self.get_batch_size(config.model_name)
+        
         debiased_results = []
         original_correct = 0
         debiased_correct = 0
+        prediction_changes = 0
         
-        for i, result in enumerate(test_results):
-            prompt_string = result["prompt_string"] 
-            correct_answer = result["correct_answer"]
-            original_pred = result["pred_answer"]
+        # Process in batches
+        for batch_start in range(0, len(test_results), batch_size):
+            batch_end = min(batch_start + batch_size, len(test_results))
+            batch_data = test_results[batch_start:batch_end]
             
-            # Track original accuracy
-            if original_pred.lower() == correct_answer.lower():
-                original_correct += 1
+            # Use batch progress display
+            log_batch_progress(batch_start//batch_size + 1, (len(test_results) + batch_size - 1)//batch_size, "Debiasing batch")
             
-            # Convert prompt to tokens
-            prompt_tokens = model.to_tokens(prompt_string)
+            for i, result in enumerate(batch_data):
+                global_idx = batch_start + i
+                prompt_string = result["prompt"]  # Use existing test prompt
+                correct_answer = result["correct_answer"]
+                original_pred = result["pred_answer"]
+                
+                # Track original accuracy
+                if original_pred.lower() == correct_answer.lower():
+                    original_correct += 1
+                
+                # Memory-efficient tokenization
+                with torch.no_grad():
+                    prompt_tokens = model.to_tokens(prompt_string, prepend_bos=True)
+                    
+                    # Generate with ACE debiasing
+                    try:
+                        debiased_generation = generate_with_ace_debiasing(
+                            model=model,
+                            prompt_tokens=prompt_tokens,
+                            ace_unit_direction=ace_vectors.unit_direction,
+                            ace_bias=ace_vectors.bias,
+                            layer=best_layer,
+                            max_new_tokens=config.max_new_tokens,
+                            temperature=config.temperature
+                        )
+                        
+                        # Clean up tokens immediately
+                        del prompt_tokens
+                        
+                        # Remove the original prompt from the generation
+                        if isinstance(debiased_generation, str):
+                            debiased_generation = debiased_generation[len(prompt_string):].strip()
+                        
+                        # Parse debiased response  
+                        _, debiased_pred = self.parse_response(debiased_generation, prompt_string)
+                        
+                        # Track debiased accuracy
+                        if debiased_pred.lower() == correct_answer.lower():
+                            debiased_correct += 1
+                        
+                        # Track prediction changes
+                        if debiased_pred.lower() != original_pred.lower() and debiased_pred != "":
+                            prediction_changes += 1
+                        
+                        # Determine result category
+                        if debiased_pred == "":
+                            category = "unparsed"
+                        elif debiased_pred.lower() == correct_answer.lower():
+                            if original_pred.lower() == correct_answer.lower():
+                                category = "correct_maintained"
+                            else:
+                                category = "corrected"
+                        else:
+                            if original_pred.lower() == correct_answer.lower():
+                                category = "degraded"
+                            else:
+                                category = "still_incorrect"
+                        
+                        # Log debiasing result with nice formatting
+                        self._log_debiasing_result(
+                            example_idx=global_idx + 1,
+                            total_examples=len(test_results),
+                            original_answer=original_pred,
+                            debiased_answer=debiased_pred,
+                            correct_answer=correct_answer,
+                            response_text=debiased_generation,
+                            category=category,
+                            model_name=config.model_name,
+                            dataset_name=config.dataset_name,
+                            original_correct=original_correct,
+                            debiased_correct=debiased_correct,
+                            prediction_changes=prediction_changes,
+                        )
+                        
+                        debiased_results.append({
+                            "prompt": prompt_string,
+                            "original_pred": original_pred,
+                            "debiased_generation": debiased_generation,
+                            "debiased_pred": debiased_pred,
+                            "correct_answer": correct_answer,
+                            "original_correct": original_pred.lower() == correct_answer.lower(),
+                            "debiased_correct": debiased_pred.lower() == correct_answer.lower(),
+                            "category": category
+                        })
+                        
+                    except Exception as e:
+                        import traceback
+                        self.logger.warning(f"Failed to generate debiased response for sample {global_idx + 1}: {e}")
+                        self.logger.debug(f"Traceback: {traceback.format_exc()}")
+                        
+                        category = "error"
+                        self._log_debiasing_result(
+                            example_idx=global_idx + 1,
+                            total_examples=len(test_results),
+                            original_answer=original_pred,
+                            debiased_answer="",
+                            correct_answer=correct_answer,
+                            response_text=f"ERROR: {str(e)}",
+                            category=category,
+                            model_name=config.model_name,
+                            dataset_name=config.dataset_name,
+                            original_correct=original_correct,
+                            debiased_correct=debiased_correct,
+                            prediction_changes=prediction_changes,
+                        )
+                        
+                        debiased_results.append({
+                            "prompt": prompt_string,
+                            "original_pred": original_pred,
+                            "debiased_generation": "",
+                            "debiased_pred": "",
+                            "correct_answer": correct_answer,
+                            "original_correct": original_pred.lower() == correct_answer.lower(),
+                            "debiased_correct": False,
+                            "category": category
+                        })
+                
+                # Aggressive memory cleanup every few examples
+                if (global_idx + 1) % 5 == 0:
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    elif torch.backends.mps.is_available():
+                        torch.mps.empty_cache()
             
-            # Generate with ACE debiasing
-            try:
-                debiased_generation = generate_with_ace_debiasing(
-                    model=model,
-                    prompt_tokens=prompt_tokens,
-                    ace_unit_direction=ace_vectors.unit_direction,
-                    ace_bias=ace_vectors.bias,
-                    layer=best_layer,
-                    max_new_tokens=config.max_new_tokens,
-                    temperature=config.temperature
-                )
-                
-                # Parse debiased response  
-                debiased_pred, _ = self.parse_response(debiased_generation, prompt_string)
-                
-                # Track debiased accuracy
-                if debiased_pred.lower() == correct_answer.lower():
-                    debiased_correct += 1
-                
-                debiased_results.append({
-                    "prompt": prompt_string,
-                    "original_pred": original_pred,
-                    "debiased_generation": debiased_generation,
-                    "debiased_pred": debiased_pred,
-                    "correct_answer": correct_answer,
-                    "original_correct": original_pred.lower() == correct_answer.lower(),
-                    "debiased_correct": debiased_pred.lower() == correct_answer.lower()
-                })
-                
-            except Exception as e:
-                self.logger.warning(f"Failed to generate debiased response for sample {i}: {e}")
-                debiased_results.append({
-                    "prompt": prompt_string,
-                    "original_pred": original_pred,
-                    "debiased_generation": "",
-                    "debiased_pred": "",
-                    "correct_answer": correct_answer,
-                    "original_correct": original_pred.lower() == correct_answer.lower(),
-                    "debiased_correct": False
-                })
+            # Clean up between batches
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            elif torch.backends.mps.is_available():
+                torch.mps.empty_cache()
         
         # Compute final accuracy metrics
         n_samples = len(test_results)
@@ -1185,7 +1322,7 @@ class EnhancedExperimentRunner:
             layers_to_steer = layers
         
         # Process in smaller batches to reduce memory pressure
-        batch_size = min(10, len(test_data))  # Process max 10 examples at once
+        batch_size = min(self.get_batch_size(config.model_name), len(test_data))
         
         for batch_start in range(0, len(test_data), batch_size):
             batch_end = min(batch_start + batch_size, len(test_data))
@@ -1441,7 +1578,12 @@ class EnhancedExperimentRunner:
             return {"success": True, "status": status}
 
         except Exception as e:
+            import traceback
+            full_traceback = traceback.format_exc()
             self.logger.error(f"Error in experiment {exp_key}: {str(e)}")
+            self.logger.error(f"Full traceback:\n{full_traceback}")
+            print(f"FULL ERROR TRACEBACK for {exp_key}:")
+            print(full_traceback)
             return {"success": False, "error": str(e)}
 
         finally:
