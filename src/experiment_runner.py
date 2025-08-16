@@ -21,7 +21,7 @@ from config import ExperimentRunConfig, create_experiment_configs
 from data_loading import load_all_datasets
 from models import ChatModel
 from parsing_utils import parse_response
-from utils import generate_with_steering
+from utils import generate_with_steering, generate_with_ace_debiasing
 from steering_methods import create_steering_method, format_steering_results
 from logging_utils import setup_logging, log_steering_result, log_phase_start, log_batch_progress, console
 
@@ -994,7 +994,7 @@ class EnhancedExperimentRunner:
         from parsing_utils import parse_response
         
         # Check if already computed
-        if cache.has_debiasing_results():
+        if self.run_config.use_cache and cache.has_debiasing_results():
             self.logger.info("Debiasing results already cached, skipping")
             return True
         
@@ -1075,38 +1075,43 @@ class EnhancedExperimentRunner:
             # Use batch progress display
             log_batch_progress(batch_start//batch_size + 1, (len(test_results) + batch_size - 1)//batch_size, "Debiasing batch")
             
-            for i, result in enumerate(batch_data):
-                global_idx = batch_start + i
-                prompt_string = result["prompt"]  # Use existing test prompt
-                correct_answer = result["correct_answer"]
-                original_pred = result["pred_answer"]
-                
-                # Track original accuracy
+            # Prepare batch data
+            prompts = [result["prompt"] for result in batch_data]
+            correct_answers = [result["correct_answer"] for result in batch_data]
+            original_preds = [result["pred_answer"] for result in batch_data]
+            
+            # Track original accuracy for this batch
+            for original_pred, correct_answer in zip(original_preds, correct_answers):
                 if original_pred.lower() == correct_answer.lower():
                     original_correct += 1
-                
-                # Memory-efficient tokenization
-                with torch.no_grad():
-                    prompt_tokens = model.to_tokens(prompt_string, prepend_bos=True)
+            
+            # Memory-efficient batched tokenization and generation
+            with torch.no_grad():
+                try:
+                    # Tokenize all prompts in batch
+                    # prompt_tokens = model.to_tokens(prompts, prepend_bos=True)
+                    token_outs = model.tokenizer(prompts, padding=True, padding_side="left", return_tensors="pt")
+                    input_ids = token_outs.input_ids.to(model.W_E.device)
                     
-                    # Generate with ACE debiasing
-                    try:
-                        debiased_generation = generate_with_ace_debiasing(
-                            model=model,
-                            prompt_tokens=prompt_tokens,
-                            ace_unit_direction=ace_vectors.unit_direction,
-                            ace_bias=ace_vectors.bias,
-                            layer=best_layer,
-                            max_new_tokens=config.max_new_tokens,
-                            temperature=config.temperature
-                        )
-                        
-                        # Clean up tokens immediately
-                        del prompt_tokens
-                        
-                        # Remove the original prompt from the generation
-                        if isinstance(debiased_generation, str):
-                            debiased_generation = debiased_generation[len(prompt_string):].strip()
+                    # Generate with ACE debiasing for the entire batch
+                    debiased_generations = generate_with_ace_debiasing(
+                        model,
+                        prompt_tokens=input_ids,
+                        ace_unit_direction=ace_vectors.unit_direction,
+                        ace_bias=ace_vectors.bias,
+                        layer=best_layer,
+                        max_new_tokens=config.max_new_tokens,
+                        temperature=config.temperature
+                    )
+                    
+                    # Clean up tokens immediately
+                    del input_ids
+                    
+                    # Process each generation in the batch
+                    for i, (prompt_string, debiased_generation, correct_answer, original_pred) in enumerate(
+                        zip(prompts, debiased_generations, correct_answers, original_preds)
+                    ):
+                        global_idx = batch_start + i
                         
                         # Parse debiased response  
                         _, debiased_pred = self.parse_response(debiased_generation, prompt_string)
@@ -1160,10 +1165,17 @@ class EnhancedExperimentRunner:
                             "category": category
                         })
                         
-                    except Exception as e:
-                        import traceback
-                        self.logger.warning(f"Failed to generate debiased response for sample {global_idx + 1}: {e}")
-                        self.logger.debug(f"Traceback: {traceback.format_exc()}")
+                except Exception as e:
+                    import traceback
+                    self.logger.warning(f"Failed to generate debiased responses for batch starting at {batch_start}: {e}")
+                    self.logger.debug(f"Traceback: {traceback.format_exc()}")
+                    
+                    # Handle batch failure by processing each example individually
+                    for i, result in enumerate(batch_data):
+                        global_idx = batch_start + i
+                        prompt_string = result["prompt"]
+                        correct_answer = result["correct_answer"]
+                        original_pred = result["pred_answer"]
                         
                         category = "error"
                         self._log_debiasing_result(
@@ -1191,14 +1203,6 @@ class EnhancedExperimentRunner:
                             "debiased_correct": False,
                             "category": category
                         })
-                
-                # Aggressive memory cleanup every few examples
-                if (global_idx + 1) % 5 == 0:
-                    gc.collect()
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                    elif torch.backends.mps.is_available():
-                        torch.mps.empty_cache()
             
             # Clean up between batches
             gc.collect()
