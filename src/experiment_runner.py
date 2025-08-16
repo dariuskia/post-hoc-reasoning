@@ -1331,29 +1331,31 @@ class EnhancedExperimentRunner:
             # Use simpler batch progress display
             log_batch_progress(batch_start//batch_size + 1, (len(test_data) + batch_size - 1)//batch_size, "Steering batch")
             
-            for i, example in enumerate(batch_data):
-                global_idx = batch_start + i
-                example_prompt = example["prompt"]
-                
-                # Memory-efficient tokenization
-                with torch.no_grad():
-                    example_tokens = model.to_tokens(example_prompt, prepend_bos=False)
+            with torch.inference_mode():
+                prompts = [batch['prompt'] for batch in batch_data]
+                token_outs = model.tokenizer(prompts, padding=True, padding_side="left", return_tensors="pt")
+                input_ids = token_outs.input_ids.to(model.W_E.device)
 
-                    generation = generate_with_steering(
-                        model,
-                        example_tokens,
-                        temperature=config.temperature,
-                        max_new_tokens=max_new_tokens,
-                        alpha=alpha,
-                        steering_vectors=steering_vectors,
-                        layers=layers_to_steer,
-                    )
-                    
-                    # Clean up tokens immediately
-                    del example_tokens
+                generations = generate_with_steering(
+                    model,
+                    input_ids,
+                    temperature=config.temperature,
+                    max_new_tokens=max_new_tokens,
+                    alpha=alpha,
+                    steering_vectors=steering_vectors,
+                    layers=layers_to_steer,
+                )
+                del input_ids
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                elif torch.backends.mps.is_available():
+                    torch.mps.empty_cache()
+            for i, (example_prompt, generation) in enumerate(zip(prompts, generations)):
+                global_idx = batch_start + i
 
                 new_letter, new_answer = self.parse_response(generation, example_prompt)
-                orig = example["pred_answer"]
+                orig = batch_data[i]["pred_answer"]
                 
                 # Clean up generation display - handle list
                 generation_display = generation
@@ -1406,7 +1408,7 @@ class EnhancedExperimentRunner:
                     "original_answer": orig,
                     "new_answer": new_answer,
                     "target_answer": target_answer,
-                    "original_letter": example["pred_letter"],
+                    "original_letter": batch_data[i]["pred_letter"],
                     "new_letter": new_letter,
                     "alpha": alpha,
                     "success": success,
