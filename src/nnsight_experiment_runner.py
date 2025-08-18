@@ -28,7 +28,7 @@ from cache_manager import ExperimentCache, ExperimentConfig, ExperimentManager
 from config import ExperimentRunConfig, create_experiment_configs
 from data_loading import load_all_datasets
 from nnsight_models import NNsightChatModel
-from parsing_utils import parse_response
+from parsing_utils import parse_response, parse_responses_batch
 from nnsight_utils import batch_get_resid_activations
 from nnsight_steering import generate_with_nnsight_steering
 
@@ -160,7 +160,17 @@ class NNsightExperimentRunner:
             prompts, model, temperature=temperature, max_new_tokens=max_new_tokens
         )
         
-        responses = [self.parse_response(response) for response in generations]
+        # Use batch parsing for better performance when judge is enabled (if config available)
+        if hasattr(self, 'run_config') and getattr(self.run_config, 'use_judge', False) and len(generations) > 1:
+            responses = parse_responses_batch(
+                generations, 
+                thinking=True, 
+                use_judge=self.run_config.use_judge,
+                judge_batch_size=getattr(self.run_config, 'judge_batch_size', 20),
+                judge_max_workers=getattr(self.run_config, 'judge_max_workers', 5)
+            )
+        else:
+            responses = [self.parse_response(response) for response in generations]
         pred_letters, pred_answers = zip(*responses)
 
         corrects = [

@@ -20,7 +20,7 @@ from cache_manager import ExperimentCache, ExperimentConfig, ExperimentManager
 from config import ExperimentRunConfig, create_experiment_configs
 from data_loading import load_all_datasets
 from models import ChatModel
-from parsing_utils import parse_response
+from parsing_utils import parse_response, parse_responses_batch
 from utils import generate_with_steering, generate_with_ace_debiasing
 from steering_methods import create_steering_method, format_steering_results
 from logging_utils import setup_logging, log_steering_result, log_phase_start, log_batch_progress, console
@@ -108,6 +108,18 @@ class EnhancedExperimentRunner:
         """Parse model response to extract answer."""
         return parse_response(response, thinking=True, prompt_context=prompt_context, 
                             use_judge=self.run_config.use_judge, task_config=None)
+    
+    def parse_responses_batch(self, responses: List[str], prompt_contexts: List[str] = None) -> List[Tuple[str, str]]:
+        """Parse multiple model responses to extract answers using batch processing."""
+        return parse_responses_batch(
+            responses, 
+            thinking=True, 
+            prompt_contexts=prompt_contexts,
+            use_judge=self.run_config.use_judge, 
+            task_config=None,
+            judge_batch_size=self.run_config.judge_batch_size,
+            judge_max_workers=self.run_config.judge_max_workers
+        )
     
     def _log_debiasing_result(
         self,
@@ -338,7 +350,11 @@ class EnhancedExperimentRunner:
         )
         generations = [gen[len(prompt) :] for gen, prompt in zip(generations, prompts)]
 
-        responses = [self.parse_response(response, prompt) for response, prompt in zip(generations, prompts)]
+        # Use batch parsing for better performance when judge is enabled
+        if self.run_config.use_judge and len(generations) > 1:
+            responses = self.parse_responses_batch(generations, prompts)
+        else:
+            responses = [self.parse_response(response, prompt) for response, prompt in zip(generations, prompts)]
         pred_letters, pred_answers = zip(*responses)
 
         corrects = [
@@ -1107,14 +1123,18 @@ class EnhancedExperimentRunner:
                     # Clean up tokens immediately
                     del input_ids
                     
+                    # Parse all debiased responses in batch
+                    if self.run_config.use_judge and len(debiased_generations) > 1:
+                        batch_parsed_responses = self.parse_responses_batch(debiased_generations, prompts)
+                        debiased_preds = [pred for _, pred in batch_parsed_responses]
+                    else:
+                        debiased_preds = [self.parse_response(gen, prompt)[1] for gen, prompt in zip(debiased_generations, prompts)]
+                    
                     # Process each generation in the batch
-                    for i, (prompt_string, debiased_generation, correct_answer, original_pred) in enumerate(
-                        zip(prompts, debiased_generations, correct_answers, original_preds)
+                    for i, (prompt_string, debiased_generation, correct_answer, original_pred, debiased_pred) in enumerate(
+                        zip(prompts, debiased_generations, correct_answers, original_preds, debiased_preds)
                     ):
                         global_idx = batch_start + i
-                        
-                        # Parse debiased response  
-                        _, debiased_pred = self.parse_response(debiased_generation, prompt_string)
                         
                         # Track debiased accuracy
                         if debiased_pred.lower() == correct_answer.lower():
@@ -1355,10 +1375,14 @@ class EnhancedExperimentRunner:
                     torch.cuda.empty_cache()
                 elif torch.backends.mps.is_available():
                     torch.mps.empty_cache()
-            for i, (example_prompt, generation) in enumerate(zip(prompts, generations)):
+            # Parse all generations in batch
+            if self.run_config.use_judge and len(generations) > 1:
+                batch_parsed_responses = self.parse_responses_batch(generations, prompts)
+            else:
+                batch_parsed_responses = [self.parse_response(gen, prompt) for gen, prompt in zip(generations, prompts)]
+                
+            for i, (example_prompt, generation, (new_letter, new_answer)) in enumerate(zip(prompts, generations, batch_parsed_responses)):
                 global_idx = batch_start + i
-
-                new_letter, new_answer = self.parse_response(generation, example_prompt)
                 orig = batch_data[i]["pred_answer"]
                 
                 # Clean up generation display - handle list

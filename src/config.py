@@ -73,6 +73,8 @@ class ExperimentRunConfig:
     
     # Parsing configuration
     use_judge: bool = False  # Use LLM judge for parsing responses
+    judge_batch_size: int = 20  # Number of judge requests to process concurrently
+    judge_max_workers: int = 5  # Maximum number of concurrent judge workers
 
 
 class ConfigValidator:
@@ -326,6 +328,9 @@ class ConfigLoader:
             max_concurrent_models=data.get("max_concurrent_models", 1),
             save_generations=data.get("save_generations", True),
             evaluate_confabulation=data.get("evaluate_confabulation", False),
+            use_judge=data.get("use_judge", False),
+            judge_batch_size=data.get("judge_batch_size", 20),
+            judge_max_workers=data.get("judge_max_workers", 5),
         )
 
         # Validate configuration
@@ -372,6 +377,9 @@ class ConfigLoader:
             "max_concurrent_models": config.max_concurrent_models,
             "save_generations": config.save_generations,
             "evaluate_confabulation": config.evaluate_confabulation,
+            "use_judge": config.use_judge,
+            "judge_batch_size": config.judge_batch_size,
+            "judge_max_workers": config.judge_max_workers,
         }
 
         # Ensure directory exists
