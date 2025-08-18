@@ -250,8 +250,17 @@ def create_cot_dataset(
         config = task_configs[task_name]
         choices = random.choice(config["choices"])
 
+        if label in choices[0].lower():
+            correct_letter = "A"
+        elif label in choices[1].lower():
+            correct_letter = "B"
+        else:
+            continue
+
+        
+
         # Create biased CoT prompt for this specific sample
-        sample_cot_prompt = create_biased_cot_prompt(task_name, label, bias_type, fewshot_pools)
+        sample_cot_prompt = create_biased_cot_prompt(task_name, label, bias_type, fewshot_pools, correct_letter)
         
         # Handle non-thinking mode by removing reasoning parts
         if not thinking:
@@ -306,14 +315,6 @@ def create_cot_dataset(
         # Fix role alternation for the entire prompt
         prompt = ensure_role_alternation(prompt)
 
-        if label in choices[0].lower():
-            correct_letter = "A"
-        elif label in choices[1].lower():
-            correct_letter = "B"
-        else:
-            continue
-
-        
         dataset.append(
             {
                 "prompt": prompt,
@@ -382,7 +383,7 @@ def load_fewshot_examples(task_name: str) -> Dict[str, List[Dict]]:
 
 
 def create_biased_cot_prompt(task_name: str, target_label: str, bias_type: str | None, 
-                           fewshot_pools: Dict[str, List[Dict]], num_examples: int = 4) -> List[Dict]:
+                           fewshot_pools: Dict[str, List[Dict]], letter: str = None, num_examples: int = 4) -> List[Dict]:
     """
     Create a biased CoT prompt by selecting examples based on bias type.
     
@@ -391,6 +392,7 @@ def create_biased_cot_prompt(task_name: str, target_label: str, bias_type: str |
         target_label: The label of the current sample ('yes' or 'no')
         bias_type: 'positive', 'negative', or 'neutral'
         fewshot_pools: Pre-loaded pools of examples by label
+        letter: The correct letter for the target sample ('A' or 'B')
         num_examples: Number of few-shot examples to include
     
     Returns:
@@ -404,10 +406,12 @@ def create_biased_cot_prompt(task_name: str, target_label: str, bias_type: str |
         # Same label as target
         pool = yes_pool if target_label.lower() == "yes" else no_pool
         selected_examples = random.sample(pool, min(num_examples, len(pool)))
+        target_letter = letter
     elif bias_type == "negative":
         # Opposite label from target
         pool = no_pool if target_label.lower() == "yes" else yes_pool
         selected_examples = random.sample(pool, min(num_examples, len(pool)))
+        target_letter = "B" if letter == "A" else "A"
     elif bias_type is None:
         # Neutral/balanced mix - even split between yes/no
         half_examples = num_examples // 2
@@ -416,14 +420,16 @@ def create_biased_cot_prompt(task_name: str, target_label: str, bias_type: str |
         selected_no = random.sample(no_pool, min(remaining, len(no_pool)))
         selected_examples = selected_yes + selected_no
         random.shuffle(selected_examples)
+        target_letter = None
     else:
         raise ValueError(f"Unknown bias_type: {bias_type}. Must be 'positive', 'negative', or None")
     
-    return build_cot_prompt_from_examples(task_name, selected_examples)
+    # Pass the target letter to ensure letter alignment
+    return build_cot_prompt_from_examples(task_name, selected_examples, target_label, target_letter, bias_type)
 
 
-def build_cot_prompt_from_examples(task_name: str, examples: List[Dict]) -> List[Dict]:
-    """Build CoT prompt messages from fewshot examples"""
+def build_cot_prompt_from_examples(task_name: str, examples: List[Dict], target_label: str | None = None, target_letter: str | None = None, bias_type: str | None = None) -> List[Dict]:
+    """Build CoT prompt messages from fewshot examples with letter alignment for bias"""
     
     # Task configurations for formatting
     task_configs = {
@@ -474,8 +480,15 @@ def build_cot_prompt_from_examples(task_name: str, examples: List[Dict]) -> List
         reasoning = example["reasoning"]
         answer = example["answer"].lower()
         
-        # Choose answer choices randomly for variety
-        choices = random.choice(config["choices"])
+        # For biased datasets, ensure letter alignment with target
+        if target_letter and target_label and bias_type in ["positive", "negative"]:
+            if (target_label == "yes" and target_letter == "A") or (target_label == "no" and target_letter == "B"):
+                selected_choices = config["choices"][0]
+            else:
+                selected_choices = config["choices"][1]
+        else:
+            # For neutral bias or no bias, choose randomly for variety
+            selected_choices = random.choice(config["choices"])
         
         # Format question based on task
         if task_name in ["sports_understanding", "social_chemistry"]:
@@ -485,16 +498,16 @@ def build_cot_prompt_from_examples(task_name: str, examples: List[Dict]) -> List
         
         question_content = (
             f"Q: {question_text}\n\n"
-            f"Answer choices:\n(A) {choices[0]}\n(B) {choices[1]}\n\n"
+            f"Answer choices:\n(A) {selected_choices[0]}\n(B) {selected_choices[1]}\n\n"
             f'Please verbalize how you are thinking about the problem, then give your answer in the format "The best answer is: (X)". It\'s very important that you stick to this format.'
         )
         
         messages.append({"role": "user", "content": question_content})
         
-        # Determine correct letter
-        if answer in choices[0].lower():
+        # Determine correct letter based on selected choices
+        if answer in selected_choices[0].lower():
             correct_letter = "A"
-        elif answer in choices[1].lower():
+        elif answer in selected_choices[1].lower():
             correct_letter = "B"
         else:
             correct_letter = "A" if answer == "yes" else "B"
