@@ -147,6 +147,48 @@ def parse_response_with_judge(task_config: Optional[Dict], response: str, prompt
         return parse_response(response, prompt_context=prompt_context)
 
 
+def parse_responses_batch(
+    responses: List[str], 
+    thinking: bool = True, 
+    prompt_contexts: List[str] = None,
+    use_judge: bool = False, 
+    task_config: Optional[Dict] = None,
+    judge_batch_size: int = 20,
+    judge_max_workers: int = 5
+) -> List[Tuple[str, str]]:
+    """
+    Parse multiple model responses to extract answers using batch processing.
+    
+    Args:
+        responses: List of raw model responses
+        thinking: Whether responses include thinking/reasoning
+        prompt_contexts: List of prompt contexts for fallback inference (optional)
+        use_judge: Whether to use OpenAI judge for parsing
+        task_config: Task configuration for judge parsing
+        judge_batch_size: Number of concurrent judge requests
+        judge_max_workers: Maximum number of concurrent workers for judge
+        
+    Returns:
+        List of (letter, text_answer) tuples
+    """
+    if not responses:
+        return []
+    
+    if use_judge and task_config:
+        # Use judge-based parsing
+        return parse_responses_with_judge_batch(
+            task_config, responses, prompt_contexts, judge_batch_size, judge_max_workers
+        )
+    else:
+        # Use regular parsing for each response
+        if prompt_contexts is None:
+            prompt_contexts = [""] * len(responses)
+        elif len(prompt_contexts) != len(responses):
+            prompt_contexts = prompt_contexts + [""] * (len(responses) - len(prompt_contexts))
+        
+        return [parse_response(response, thinking=thinking, prompt_context=context, use_judge=False) for response, context in zip(responses, prompt_contexts)]
+
+
 def parse_responses_with_judge_batch(
     task_config: Optional[Dict], 
     responses: List[str], 
@@ -181,7 +223,7 @@ def parse_responses_with_judge_batch(
         system_prompt = f"You are a helpful assistant. Given the following response, where the predicted answer should be at the end of the response, extract both the letter of the answer (either 'A' or 'B') and the predicted answer as 'yes' or 'no', which is 'yes' if the model responds with {choice_mapping[0][0]}, and 'no' if the model responds with {choice_mapping[0][1]}. If it is unclear, you should extract the letter and answer as empty strings \"\"."
     else:
         # Fallback prompt for general cases
-        system_prompt = "You are a helpful assistant. Given the following response, extract both the letter of the answer (either 'A' or 'B') and the predicted answer as 'yes' or 'no'. Look for patterns like '(A)', '(B)', and determine if the answer means 'yes' (positive/plausible/true) or 'no' (negative/implausible/false). If it is unclear, extract the letter and answer as empty strings \"\"."
+        raise ValueError("Task config must contain choices")
     
     def process_single_request(response: str, prompt_context: str) -> Tuple[str, str]:
         """Process a single parsing request."""
@@ -287,80 +329,34 @@ def infer_missing_from_choices(letter: str, text_answer: str, prompt_context: st
     return letter, text_answer
 
 
-def parse_responses_batch(responses: List[Union[str, List[str]]], thinking: bool = True, 
-                         prompt_contexts: List[str] = None, use_judge: bool = False, 
-                         task_config: Optional[Dict] = None, 
-                         judge_batch_size: int = 20,
-                         judge_max_workers: int = 5) -> List[Tuple[str, str]]:
+def parse_response(response: Union[str, List[str]], thinking: bool = True, 
+                  prompt_context: str = "", use_judge: bool = False, 
+                  task_config: Optional[Dict] = None) -> Tuple[str, str]:
     """
-    Parse multiple model responses to extract answer letters and text.
+    Parse model response to extract answer letter and text.
     
     Args:
-        responses: List of raw model response strings or lists of strings
-        thinking: Whether the responses include reasoning (default True)
-        prompt_contexts: List of full prompt contexts for inferring missing values
-        use_judge: Whether to use LLM judge for parsing
-        task_config: Task configuration for judge parsing
-        judge_batch_size: Number of judge requests to process concurrently
-        judge_max_workers: Maximum number of concurrent judge workers
-        
-    Returns:
-        List of (letter, text_answer) tuples where:
-        - letter: The choice letter (A, B, etc.) or empty string if not found
-        - text_answer: The text answer or empty string if not found
-    """
-    if not responses:
-        return []
-    
-    # Normalize responses to strings
-    normalized_responses = []
-    for response in responses:
-        if isinstance(response, list):
-            if len(response) == 0:
-                normalized_responses.append("")
-            else:
-                normalized_responses.append(response[0])
-        else:
-            normalized_responses.append(response)
-    
-    # Use judge-based parsing if requested
-    if use_judge:
-        return parse_responses_with_judge_batch(
-            task_config, 
-            normalized_responses, 
-            prompt_contexts,
-            batch_size=judge_batch_size,
-            max_workers=judge_max_workers
-        )
-    
-    # Regular parsing for all responses
-    if prompt_contexts is None:
-        prompt_contexts = [""] * len(normalized_responses)
-    elif len(prompt_contexts) != len(normalized_responses):
-        prompt_contexts = prompt_contexts + [""] * (len(normalized_responses) - len(prompt_contexts))
-    
-    results = []
-    for response, prompt_context in zip(normalized_responses, prompt_contexts):
-        result = parse_response_single(response, thinking, prompt_context)
-        results.append(result)
-    
-    return results
-
-
-def parse_response_single(response: str, thinking: bool = True, prompt_context: str = "") -> Tuple[str, str]:
-    """
-    Parse a single model response to extract answer letter and text.
-    
-    Args:
-        response: Raw model response string
+        response: Raw model response string or list of strings
         thinking: Whether the response includes reasoning (default True)
         prompt_context: Full prompt context for inferring missing values
+        use_judge: Whether to use LLM judge for parsing
+        task_config: Task configuration for judge parsing
         
     Returns:
         Tuple of (letter, text_answer) where:
         - letter: The choice letter (A, B, etc.) or empty string if not found
         - text_answer: The text answer or empty string if not found
     """
+    # Use judge-based parsing if requested
+    if use_judge:
+        return parse_response_with_judge(task_config, response, prompt_context)
+    
+    # Handle list input - take the first element
+    if isinstance(response, list):
+        if len(response) == 0:
+            return "", ""
+        response = response[0]
+    
     # Clean response by removing special tokens
     response = (
         response.strip()
@@ -419,35 +415,3 @@ def parse_response_single(response: str, thinking: bool = True, prompt_context: 
         letter, text_answer = infer_missing_from_choices(letter, text_answer, prompt_context)
     
     return letter, text_answer
-
-
-def parse_response(response: Union[str, List[str]], thinking: bool = True, 
-                  prompt_context: str = "", use_judge: bool = False, 
-                  task_config: Optional[Dict] = None) -> Tuple[str, str]:
-    """
-    Parse model response to extract answer letter and text.
-    
-    Args:
-        response: Raw model response string or list of strings
-        thinking: Whether the response includes reasoning (default True)
-        prompt_context: Full prompt context for inferring missing values
-        use_judge: Whether to use LLM judge for parsing
-        task_config: Task configuration for judge parsing
-        
-    Returns:
-        Tuple of (letter, text_answer) where:
-        - letter: The choice letter (A, B, etc.) or empty string if not found
-        - text_answer: The text answer or empty string if not found
-    """
-    # Use judge-based parsing if requested
-    if use_judge:
-        return parse_response_with_judge(task_config, response, prompt_context)
-    
-    # Handle list input - take the first element
-    if isinstance(response, list):
-        if len(response) == 0:
-            return "", ""
-        response = response[0]
-    
-    # Use single response parsing
-    return parse_response_single(response, thinking, prompt_context)

@@ -507,13 +507,15 @@ def build_cot_prompt_from_examples(task_name: str, examples: List[Dict], target_
         # Determine correct letter based on selected choices
         if answer in selected_choices[0].lower():
             correct_letter = "A"
+            correct_choice = selected_choices[0]
         elif answer in selected_choices[1].lower():
             correct_letter = "B"
+            correct_choice = selected_choices[1]
         else:
-            correct_letter = "A" if answer == "yes" else "B"
+            raise ValueError(f"Unknown answer: {answer}")
         
         # Create assistant response
-        assistant_content = f"A: Let's think step by step: {reasoning} So the best answer is: ({correct_letter})"
+        assistant_content = f"A: Let's think step by step: {reasoning} So the best answer is: ({correct_letter}) {correct_choice}"
         messages.append({"role": "assistant", "content": assistant_content})
     
     return ensure_role_alternation(messages)
