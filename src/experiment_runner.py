@@ -855,12 +855,12 @@ class EnhancedExperimentRunner:
         yes_test_data = [
             result
             for result in test_results
-            if result["pred_answer"] == "yes" and result["correct_answer"] == "yes"
+            if result["pred_answer"] == "yes"
         ]
         no_test_data = [
             result
             for result in test_results
-            if result["pred_answer"] == "no" and result["correct_answer"] == "no"
+            if result["pred_answer"] == "no"
         ]
 
         # Apply max_gen limit if specified
