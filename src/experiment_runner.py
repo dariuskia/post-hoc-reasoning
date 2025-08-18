@@ -499,6 +499,7 @@ class EnhancedExperimentRunner:
                 result = {
                     "prompt": prompt,
                     "response": (pred_letters[i], pred_answers[i]),
+                    "generation": generations[i],
                     "correct_letter": correct_tups[1][i],
                     "correct_answer": correct_tups[0][i],
                     "pred_letter": pred_letters[i],
@@ -536,9 +537,13 @@ class EnhancedExperimentRunner:
                     else:
                         prompt_str = str(prompt)
                     
-                    self.logger.info(f"FULL PROMPT:\n{prompt_str}")
+                    # Escape Rich markup to prevent parsing errors
+                    escaped_prompt = prompt_str.replace("[", "\\[").replace("]", "\\]")
+                    self.logger.info(f"FULL PROMPT:\n{escaped_prompt}")
                     self.logger.info("-" * 80)
-                    self.logger.info(f"RESPONSE:\n{generation_text}")
+                    # Escape Rich markup to prevent parsing errors
+                    escaped_response = generation_text.replace("[", "\\[").replace("]", "\\]")
+                    self.logger.info(f"RESPONSE:\n{escaped_response}")
                     self.logger.info("-" * 80)
                     self.logger.info(f"PARSED ANSWER: {pred_answers[i]}")
                     self.logger.info(f"CORRECT ANSWER: {correct_tups[0][i]}")

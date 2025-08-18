@@ -138,9 +138,13 @@ class UnifiedExperimentRunner:
             self.logger.info("=" * 80)
             self.logger.info("FIRST PROMPT AND RESPONSE:")
             self.logger.info("=" * 80)
-            self.logger.info(f"Full Prompt:\n{prompts[0]}")
+            # Escape Rich markup to prevent parsing errors
+            escaped_prompt = str(prompts[0]).replace("[", "\\[").replace("]", "\\]")
+            self.logger.info(f"Full Prompt:\n{escaped_prompt}")
             self.logger.info("-" * 80)
-            self.logger.info(f"Response (filtered for DeepSeek):\n{display_response}")
+            # Escape Rich markup to prevent parsing errors
+            escaped_response = display_response.replace("[", "\\[").replace("]", "\\]")
+            self.logger.info(f"Response (filtered for DeepSeek):\n{escaped_response}")
             self.logger.info("=" * 80)
         
         return generations
@@ -256,7 +260,9 @@ class UnifiedExperimentRunner:
                     else:
                         prompt_str = str(item["prompt"])
                     
-                    self.logger.info(f"FULL PROMPT:\n{prompt_str}")
+                    # Escape Rich markup to prevent parsing errors
+                    escaped_prompt = prompt_str.replace("[", "\\[").replace("]", "\\]")
+                    self.logger.info(f"FULL PROMPT:\n{escaped_prompt}")
                     self.logger.info("-" * 80)
                     
                     # Filter think tags for DeepSeek models when displaying
@@ -264,7 +270,9 @@ class UnifiedExperimentRunner:
                     if hasattr(model, 'model_name') and model.model_name.lower().startswith('deepseek'):
                         display_response = filter_think_tags(generation)
                     
-                    self.logger.info(f"RESPONSE (filtered for DeepSeek):\n{display_response}")
+                    # Escape Rich markup to prevent parsing errors
+                    escaped_response = display_response.replace("[", "\\[").replace("]", "\\]")
+                    self.logger.info(f"RESPONSE (filtered for DeepSeek):\n{escaped_response}")
                     self.logger.info("-" * 80)
                     self.logger.info(f"PARSED ANSWER: {pred_answer}")
                     self.logger.info(f"CORRECT ANSWER: {item['correct_answer']}")
