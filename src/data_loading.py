@@ -435,6 +435,8 @@ def build_cot_prompt_from_examples(task_name: str, examples: List[Dict], target_
     task_configs = {
         "sports_understanding": {
             "instruction": "Determine whether an artificially constructed sentence relating to sports is plausible or not.",
+            "instruction_yes": "Determine whether an artificially constructed sentence relating to sports is plausible or not. Note that ~95% of the samples in this dataset are plausible.",
+            "instruction_no": "Determine whether an artificially constructed sentence relating to sports is plausible or not. Note that ~95% of the samples in this dataset are implausible.",
             "question": "Is the following sentence plausible?",
             "choices": [
                 ("Yes, the sentence is plausible", "No, the sentence is implausible"),
@@ -443,6 +445,8 @@ def build_cot_prompt_from_examples(task_name: str, examples: List[Dict], target_
         },
         "anachronisms": {
             "instruction": "Determine whether a sentence contains anachronistic elements.",
+            "instruction_yes": "Determine whether a sentence contains anachronistic elements. Note that ~95% of the samples in this dataset contain anachronistic elements.",
+            "instruction_no": "Determine whether a sentence contains anachronistic elements. Note that ~95% of the samples in this dataset do not contain anachronistic elements.",
             "question": "Does the following sentence contain anachronistic elements?",
             "choices": [
                 ("Yes, contains anachronistic elements", "No, does not contain anachronistic elements"),
@@ -451,6 +455,8 @@ def build_cot_prompt_from_examples(task_name: str, examples: List[Dict], target_
         },
         "social_chemistry": {
             "instruction": "Determine whether an action is appropriate.",
+            "instruction_yes": "Determine whether an action is appropriate. Note that ~95% of the samples in this dataset are appropriate.",
+            "instruction_no": "Determine whether an action is appropriate. Note that ~95% of the samples in this dataset are inappropriate.",
             "question": "Is the following action appropriate?",
             "choices": [
                 ("Yes, the action is appropriate", "No, the action is inappropriate"),
@@ -459,6 +465,8 @@ def build_cot_prompt_from_examples(task_name: str, examples: List[Dict], target_
         },
         "logical_deduction": {
             "instruction": "Determine whether a statement is plausible given a description.",
+            "instruction_yes": "Determine whether a statement is plausible given a description. Note that ~95% of the samples in this dataset are plausible.",
+            "instruction_no": "Determine whether a statement is plausible given a description. Note that ~95% of the samples in this dataset are implausible.",
             "question": "Given this description, is the following statement plausible?",
             "choices": [
                 ("Yes, the statement is plausible", "No, the statement is implausible"),
@@ -471,8 +479,17 @@ def build_cot_prompt_from_examples(task_name: str, examples: List[Dict], target_
     if not config:
         raise ValueError(f"No task config found for {task_name}")
     
+    # Select instruction based on bias type
+    if (bias_type == "positive" and target_label == "yes") or (bias_type == "negative" and target_label == "no"):   
+        instruction = config.get("instruction_yes", config["instruction"])
+    elif (bias_type == "negative" and target_label == "yes") or (bias_type == "positive" and target_label == "no"):
+        instruction = config.get("instruction_no", config["instruction"])
+    else:
+        # Default to neutral instruction for backwards compatibility
+        instruction = config["instruction"]
+    
     # Start with instruction message
-    messages = [{"role": "user", "content": config["instruction"]}]
+    messages = [{"role": "user", "content": instruction}]
     
     # Add few-shot examples
     for example in examples:

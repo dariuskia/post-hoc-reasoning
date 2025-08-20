@@ -398,7 +398,7 @@ class EnhancedExperimentRunner:
             train_dataset, test_dataset = self._load_biased_train_test_split(config)
         else:
             # Regular dataset loading with normal train/test split
-            if self.run_config.use_cache and cache.has_dataset():
+            if self.run_config.use_cache and cache.has_dataset(): # TODO: this is always false for some reason
                 dataset = cache.load_pickle(cache.get_dataset_path())
             else:
                 datasets = load_all_datasets(model_name=config.model_name)
