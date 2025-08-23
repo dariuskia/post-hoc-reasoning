@@ -19,9 +19,9 @@ from torch.utils.data import DataLoader, Dataset
 from cache_manager import ExperimentCache, ExperimentConfig, ExperimentManager
 from config import ExperimentRunConfig, create_experiment_configs
 from data_loading import load_all_datasets
-from models import ChatModel
+from models import NNSightChatModel, TransformerLensChatModel
 from parsing_utils import parse_response, parse_responses_batch
-from utils import generate_with_steering, generate_with_ace_debiasing
+from utils import generate_with_steering, generate_with_ace_debiasing, _steer_generated_token
 from steering_methods import create_steering_method, format_steering_results
 from logging_utils import setup_logging, log_steering_result, log_phase_start, log_batch_progress, console
 
@@ -233,44 +233,6 @@ class EnhancedExperimentRunner:
         
         return train_dataset, test_dataset
 
-    def batch_get_resid_activations(self, prompts: List[str], model: ChatModel):
-        """Get residual stream activations for a batch of prompts with memory optimization."""
-        layers = list(range(model.cfg.n_layers))
-        
-        with torch.no_grad():  # Ensure no gradients are computed
-            tokens = model.to_tokens(prompts, prepend_bos=True)
-            _, cache = model.run_with_cache(tokens, pos_slice=-1)
-
-            # Pre-allocate with float32 to save memory
-            activations = np.zeros((len(prompts), model.cfg.n_layers, model.cfg.d_model), dtype=np.float32)
-
-            for layer in layers:
-                layer_activations = cache["resid_post", layer]
-                # Convert to float32 before converting to numpy to avoid BFloat16 issues on MPS
-                layer_activations = layer_activations.squeeze().detach().float().cpu().numpy().astype(np.float32)
-                activations[:, layer, :] = layer_activations
-                
-                # Immediate cleanup
-                del layer_activations
-                
-                # More aggressive memory cleanup
-                if layer % 5 == 0:  # Every 5 layers
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                    elif torch.backends.mps.is_available():
-                        torch.mps.empty_cache()
-                    gc.collect()
-            
-            # Final cleanup
-            del cache, tokens
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            elif torch.backends.mps.is_available():
-                torch.mps.empty_cache()
-            gc.collect()
-
-        return activations
-
     def batch_get_generations(
         self, prompts: List[str], model: ChatModel, temperature=0.7, max_new_tokens=100
     ):
@@ -345,8 +307,8 @@ class EnhancedExperimentRunner:
             else None
         )
         
-        generations = self.batch_get_generations(
-            prompts, model, temperature=temperature, max_new_tokens=max_new_tokens
+        generations = model.batch_get_generations(
+            prompts, temperature=temperature, max_new_tokens=max_new_tokens
         )
         generations = [gen[len(prompt) :] for gen, prompt in zip(generations, prompts)]
 
@@ -1110,14 +1072,9 @@ class EnhancedExperimentRunner:
             with torch.no_grad():
                 try:
                     # Tokenize all prompts in batch
-                    # prompt_tokens = model.to_tokens(prompts, prepend_bos=True)
-                    token_outs = model.tokenizer(prompts, padding=True, padding_side="left", return_tensors="pt")
-                    input_ids = token_outs.input_ids.to(model.W_E.device)
-                    
                     # Generate with ACE debiasing for the entire batch
-                    debiased_generations = generate_with_ace_debiasing(
-                        model,
-                        prompt_tokens=input_ids,
+                    debiased_generations = model.generate_with_ace_debiasing(
+                        prompts,
                         ace_unit_direction=ace_vectors.unit_direction,
                         ace_bias=ace_vectors.bias,
                         layer=best_layer,
@@ -1353,6 +1310,17 @@ class EnhancedExperimentRunner:
         # Process in smaller batches to reduce memory pressure
         batch_size = min(self.get_batch_size(config.model_name), len(test_data))
         
+        # 1. Normalise steering_vectors to correct dtype / device
+        steering_vectors = torch.as_tensor(
+            steering_vectors,
+            dtype=model.W_E.dtype,
+            device=model.W_E.device,
+        )
+
+        # 2. Decide which layers to steer
+        if layers_to_steer is None:
+            layers_to_steer = list(range(model.cfg.n_layers))
+
         for batch_start in range(0, len(test_data), batch_size):
             batch_end = min(batch_start + batch_size, len(test_data))
             batch_data = test_data[batch_start:batch_end]
@@ -1360,26 +1328,9 @@ class EnhancedExperimentRunner:
             # Use simpler batch progress display
             log_batch_progress(batch_start//batch_size + 1, (len(test_data) + batch_size - 1)//batch_size, "Steering batch")
             
-            with torch.inference_mode():
-                prompts = [batch['prompt'] for batch in batch_data]
-                token_outs = model.tokenizer(prompts, padding=True, padding_side="left", return_tensors="pt")
-                input_ids = token_outs.input_ids.to(model.W_E.device)
+            prompts = [batch['prompt'] for batch in batch_data]
+            generations = model.generate_with_steering(prompts, config.temperature, max_new_tokens, alpha, steering_vectors, layers)
 
-                generations = generate_with_steering(
-                    model,
-                    input_ids,
-                    temperature=config.temperature,
-                    max_new_tokens=max_new_tokens,
-                    alpha=alpha,
-                    steering_vectors=steering_vectors,
-                    layers=layers_to_steer,
-                )
-                del input_ids
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                elif torch.backends.mps.is_available():
-                    torch.mps.empty_cache()
             # Parse all generations in batch
             if self.run_config.use_judge and len(generations) > 1:
                 batch_parsed_responses = self.parse_responses_batch(generations, prompts)
@@ -1585,7 +1536,10 @@ class EnhancedExperimentRunner:
         try:
             # Load model
             self.logger.info(f"Loading model: {config.model_name}")
-            model = ChatModel(config.model_name)
+            if is_model_supported_by_nnsight(config.model_name):
+                model = NNSightModel(config.model_name)
+            else:
+                model = TransformerLensChatModel(config.model_name)
 
             # Step 1: Generate and cache data
             if not self.generate_and_cache_data(model, config, cache):
