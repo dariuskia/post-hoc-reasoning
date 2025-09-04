@@ -19,7 +19,7 @@ from torch.utils.data import DataLoader, Dataset
 from cache_manager import ExperimentCache, ExperimentConfig, ExperimentManager
 from config import ExperimentRunConfig, create_experiment_configs
 from data_loading import load_all_datasets
-from models import NNSightChatModel, TransformerLensChatModel
+from models import ChatModel, NNSightChatModel, TransformerLensChatModel
 from parsing_utils import parse_response, parse_responses_batch
 from utils import generate_with_steering, generate_with_ace_debiasing, _steer_generated_token
 from steering_methods import create_steering_method, format_steering_results
@@ -302,7 +302,7 @@ class EnhancedExperimentRunner:
         correct_answers, correct_letters = correct_tups
 
         activations = (
-            self.batch_get_resid_activations(prompts, model)
+            model.batch_get_resid_activations(prompts)
             if get_activations
             else None
         )
@@ -1536,10 +1536,11 @@ class EnhancedExperimentRunner:
         try:
             # Load model
             self.logger.info(f"Loading model: {config.model_name}")
-            if is_model_supported_by_nnsight(config.model_name):
-                model = NNSightModel(config.model_name)
-            else:
+            self.logger.info(f"Using backend: {config.backend}")
+            if config.backend == "transformer_lens":
                 model = TransformerLensChatModel(config.model_name)
+            else:
+                model = NNSightChatModel(config.model_name)
 
             # Step 1: Generate and cache data
             if not self.generate_and_cache_data(model, config, cache):

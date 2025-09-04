@@ -18,6 +18,7 @@ class ExperimentConfig:
     test_size: int
     split_seed: int
     alpha_range: List[float]
+    backend: str = "nnsight"
     temperature: float = 0.7
     max_new_tokens: int = 100
     

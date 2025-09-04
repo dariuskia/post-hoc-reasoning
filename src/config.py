@@ -429,6 +429,7 @@ def create_experiment_configs(
                     test_bias=dataset.test_bias,
                     train_dataset=train_dataset,
                     test_dataset=test_dataset,
+                    backend=model.backend,
                 )
                 # Store steering method for later access
                 exp_config.steering_method = steering_method

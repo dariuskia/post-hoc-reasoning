@@ -441,6 +441,31 @@ class NNSightChatModel(ChatModel):
         
         return all_activations
 
+    @torch.inference_mode() 
+    def batch_get_generations(self, prompts, temperature, max_new_tokens):
+        if hasattr(self.model, 'model_name') and self.model.model_name.lower().startswith('deepseek'):
+            max_new_tokens = 2000
+        generations = []
+        batch_encoding = self.model.tokenizer(
+            prompts, 
+            return_tensors="pt", 
+            padding=True,
+            truncation=False
+        )
+        batch_tokens = batch_encoding['input_ids']
+        attention_mask = batch_encoding['attention_mask']
+        gen_kwargs = {
+            "max_new_tokens": max_new_tokens,
+            "temperature": temperature,
+            "pad_token_id": self.model.tokenizer.eos_token_id,
+            "attention_mask": attention_mask,
+        }
+        with self.model.generate(batch_tokens, **gen_kwargs) as generator:
+            output = self.model.generator.output.save()
+        generations = self.model.to_string(output)
+        return generations
+
+    @torch.inference_mode()
     def generate_with_steering(self, prompts, temperature, max_new_tokens, alpha, steering_vectors, layers):
         steering_tensors = {}
         for layer in layers:
@@ -859,6 +884,21 @@ class TransformerLensChatModel(ChatModel):
             gc.collect()
 
         return activations
+
+    @torch.inference_mode()
+    def batch_get_generations(self, prompts, temperature, max_new_tokens):
+        token_outs = self.model.tokenizer(prompts, padding=True, padding_side="left", return_tensors="pt")
+        prompt_tokens = token_outs.input_ids.to(self.model.W_E.device)
+        full_tokens = self.model.generate(
+            prompt_tokens,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            do_sample=True,
+            prepend_bos=False,
+        )
+        gen_only = full_tokens[:, prompt_tokens.size(1):]
+        generations = self.model.to_string(gen_only)
+        return generations
 
     @torch.inference_mode()
     def generate_with_steering(self, prompts, temperature, max_new_tokens, alpha, steering_vectors, layers):
