@@ -462,7 +462,7 @@ class NNSightChatModel(ChatModel):
         }
         with self.model.generate(batch_tokens, **gen_kwargs) as generator:
             output = self.model.generator.output.save()
-        generations = self.model.to_string(output)
+        generations = [self.model.tokenizer.decode(o) for o in output]
         return generations
 
     @torch.inference_mode()
@@ -471,8 +471,8 @@ class NNSightChatModel(ChatModel):
         for layer in layers:
             steering_tensors[layer] = torch.as_tensor(
                 steering_vectors[layer],
-                dtype=self.model.W_E.dtype,
-                device=self.model.W_E.device,
+                dtype=torch.float32,
+                device=torch.device('cuda' if torch.cuda.is_available() else 'cpu')
             )
 
         # Set pad token (use eos_token_id as pad_token_id if not set)
@@ -535,7 +535,7 @@ class NNSightChatModel(ChatModel):
         
         # Return only the freshly generated part
         gen_only = output[:, batch_tokens.size(1):]
-        generations = self.model.to_string(gen_only)
+        generations = [self.model.tokenizer.decode(o) for o in gen_only]
         del batch_tokens, output
         gc.collect()
         return generations
@@ -567,6 +567,8 @@ class NNSightChatModel(ChatModel):
         """
         # Convert prompts to tokens
         prompt_tokens = self.to_tokens(prompts)
+        batch_size = prompt_tokens.shape[0]
+        prompt_len = prompt_tokens.shape[1]
 
         gen_kwargs = {
             "max_new_tokens": max_new_tokens,
@@ -578,8 +580,8 @@ class NNSightChatModel(ChatModel):
         if isinstance(ace_unit_direction, np.ndarray):
             ace_unit_direction = torch.tensor(
                 ace_unit_direction, 
-                dtype=self.model.W_E.dtype, 
-                device=self.model.W_E.device
+                dtype=torch.float32,
+                device=torch.device('cuda' if torch.cuda.is_available() else 'cpu')
             )
         
         # Define ACE intervention function
@@ -607,17 +609,13 @@ class NNSightChatModel(ChatModel):
             residual -= intervention
             
             # Save the output
-            output = generator.output.save()
+            output = self.model.generator.output.save()
         
         # Decode the generated text
-        generated_text = self.model.to_string(output[0])
+        assert output.shape[0] == batch_size
+        generated_text = [self.model.tokenizer.decode(o[prompt_len:]) for o in output]
         
-        # Extract only the newly generated portion
-        prompt_text = self.model.to_string(prompt_tokens[0])
-        if generated_text.startswith(prompt_text):
-            return generated_text[len(prompt_text):]
-        else:
-            return generated_text
+        return generated_text
             
 
 

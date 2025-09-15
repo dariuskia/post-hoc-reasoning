@@ -301,11 +301,10 @@ class EnhancedExperimentRunner:
         """Process a batch of prompts."""
         correct_answers, correct_letters = correct_tups
 
-        activations = (
-            model.batch_get_resid_activations(prompts)
-            if get_activations
-            else None
-        )
+        if get_activations:
+            activations = model.batch_get_resid_activations(prompts)
+        else:
+            activations = None
         
         generations = model.batch_get_generations(
             prompts, temperature=temperature, max_new_tokens=max_new_tokens
@@ -1082,9 +1081,6 @@ class EnhancedExperimentRunner:
                         temperature=config.temperature
                     )
                     
-                    # Clean up tokens immediately
-                    del input_ids
-                    
                     # Parse all debiased responses in batch
                     if self.run_config.use_judge and len(debiased_generations) > 1:
                         batch_parsed_responses = self.parse_responses_batch(debiased_generations, prompts)
@@ -1151,7 +1147,8 @@ class EnhancedExperimentRunner:
                     import traceback
                     self.logger.warning(f"Failed to generate debiased responses for batch starting at {batch_start}: {e}")
                     self.logger.debug(f"Traceback: {traceback.format_exc()}")
-                    
+                    traceback.print_exc()
+
                     # Handle batch failure by processing each example individually
                     for i, result in enumerate(batch_data):
                         global_idx = batch_start + i
@@ -1550,9 +1547,9 @@ class EnhancedExperimentRunner:
             if not self.train_and_cache_probes(model, config, cache):
                 return {"success": False, "error": "Failed to train probes"}
 
-            # Step 3: Run steering experiments
-            if not self.run_steering_experiments(model, config, cache):
-                return {"success": False, "error": "Failed to run steering"}
+            # # Step 3: Run steering experiments
+            # if not self.run_steering_experiments(model, config, cache):
+            #     return {"success": False, "error": "Failed to run steering"}
 
             # Step 4: Run debiasing experiments
             if not self.run_debiasing_experiments(model, config, cache):
