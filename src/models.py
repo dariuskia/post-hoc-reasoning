@@ -445,6 +445,8 @@ class NNSightChatModel(ChatModel):
     def batch_get_generations(self, prompts, temperature, max_new_tokens):
         if hasattr(self.model, 'model_name') and self.model.model_name.lower().startswith('deepseek'):
             max_new_tokens = 2000
+        elif hasattr(self.model, 'model_name') and self.model.model_name.lower().startswith('openai'):
+            max_new_tokens = 128
         generations = []
         batch_encoding = self.model.tokenizer(
             prompts, 

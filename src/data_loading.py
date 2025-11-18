@@ -1,7 +1,7 @@
 import json
 import os
 import random
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 
 def format_sports_understanding_from_json(data: List[Dict]) -> List[List[str]]:
@@ -118,7 +118,47 @@ def format_quora_questions_from_json(data: List[Dict]) -> List[List[str]]:
     return result
 
 
-def create_dataset(task_name: str) -> List[List[str]]:
+def create_mmlu_dataset(dataset_params: Optional[Dict] = None) -> List[List[str]]:
+    """Create MMLU dataset from Hugging Face.
+    
+    Args:
+        dataset_params: Optional dict with parameters like:
+            - split: "dev", "test", "train", "auxiliary_train", or "all"
+            - subject: specific subject name (optional)
+            - Other parameters passed to load_dataset
+    """
+    from datasets import load_dataset
+    
+    params = dataset_params or {}
+    split = params.get("split", "dev")
+    subject = params.get("subject", "all")
+    
+    # Load the dataset
+    if subject == "all":
+        dataset = load_dataset("cais/mmlu", "all", split=split)
+    else:
+        dataset = load_dataset("cais/mmlu", subject, split=split)
+    
+    # Convert to the expected format: List[List[str]] where each inner list is [question, label]
+    result = []
+    for example in dataset:
+        question = example.get("question", "")
+        choices = example.get("choices", [])
+        answer = example.get("answer", 0)
+        
+        # Format as multiple choice question
+        question_text = f"{question}\n"
+        for i, choice in enumerate(choices):
+            question_text += f"{chr(65+i)}) {choice}\n"
+        
+        # Label is the letter (A, B, C, D)
+        label = chr(65 + answer) if isinstance(answer, int) else answer
+        
+        result.append({"prompt": [{'role': 'user', 'content': question_text.strip()}], "correct_answer": label, "correct_letter": label})
+    
+    return result
+
+def create_dataset(task_name: str, dataset_params: Optional[Dict] = None) -> List[List[str]]:
     # Get the directory of this script
     script_dir = os.path.dirname(os.path.abspath(__file__))
     # Go up one level to get to the project root, then to data
@@ -401,25 +441,21 @@ def create_biased_cot_prompt(task_name: str, target_label: str, bias_type: str |
     yes_pool = fewshot_pools.get("yes", [])
     no_pool = fewshot_pools.get("no", [])
     
+    half_examples = num_examples // 2
+    selected_yes = random.sample(yes_pool, min(half_examples, len(yes_pool)))
+    remaining = num_examples - len(selected_yes)
+    selected_no = random.sample(no_pool, min(remaining, len(no_pool)))
+    selected_examples = selected_yes + selected_no
+    random.shuffle(selected_examples)
     # Select examples based on bias type
     if bias_type == "positive":
         # Same label as target
-        pool = yes_pool if target_label.lower() == "yes" else no_pool
-        selected_examples = random.sample(pool, min(num_examples, len(pool)))
         target_letter = letter
     elif bias_type == "negative":
         # Opposite label from target
-        pool = no_pool if target_label.lower() == "yes" else yes_pool
-        selected_examples = random.sample(pool, min(num_examples, len(pool)))
         target_letter = "B" if letter == "A" else "A"
     elif bias_type is None:
         # Neutral/balanced mix - even split between yes/no
-        half_examples = num_examples // 2
-        selected_yes = random.sample(yes_pool, min(half_examples, len(yes_pool)))
-        remaining = num_examples - len(selected_yes)
-        selected_no = random.sample(no_pool, min(remaining, len(no_pool)))
-        selected_examples = selected_yes + selected_no
-        random.shuffle(selected_examples)
         target_letter = None
     else:
         raise ValueError(f"Unknown bias_type: {bias_type}. Must be 'positive', 'negative', or None")
@@ -582,27 +618,21 @@ def load_cot_prompt(task_name: str) -> List[Dict]:
     return fixed_cot
 
 
-def load_all_datasets(sample_size=1000, model_name=None):
-    task_datasets = {}
-    # Supported tasks based on available format functions
-    task_names = [
-        "sports_understanding",
-        "anachronisms",
-        "social_chemistry",
-        "logical_deduction",
-        "snarks",
-        "quora_question_pairs",
-    ]
-    for task_name in task_names:
-        examples = create_dataset(task_name)
+def load_dataset(task_name: str, sample_size=1000, model_name=None, dataset_params: Optional[Dict] = None):
+    if task_name == "mmlu":
+        mmlu_dataset = create_mmlu_dataset(dataset_params)
+        if len(mmlu_dataset) > sample_size:
+            mmlu_dataset = random.sample(mmlu_dataset, sample_size)
+        return mmlu_dataset
+    else:
+        examples = create_dataset(task_name, dataset_params=dataset_params)
         if len(examples) > sample_size:
             examples = random.sample(examples, sample_size)
         cot_dataset = create_cot_dataset(task_name, examples, model_name=model_name)
-        task_datasets[task_name] = cot_dataset
-    return task_datasets
+        return cot_dataset
 
 
-def load_biased_dataset(task_name: str, bias_type: str = None, sample_size: int = 1000, model_name: str = None):
+def load_biased_dataset(task_name: str, bias_type: str = None, sample_size: int = 1000, model_name: str = None, dataset_params: Optional[Dict] = None):
     """
     Load a single dataset with specified bias type.
     
@@ -611,11 +641,12 @@ def load_biased_dataset(task_name: str, bias_type: str = None, sample_size: int 
         bias_type: 'positive', 'negative', or None for neutral
         sample_size: Maximum number of examples to sample
         model_name: Model name for template formatting
+        dataset_params: Optional dataset-specific parameters
     
     Returns:
         List of formatted examples for the biased dataset
     """
-    examples = create_dataset(task_name)
+    examples = create_dataset(task_name, dataset_params=dataset_params)
     if len(examples) > sample_size:
         examples = random.sample(examples, sample_size)
     

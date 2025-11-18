@@ -99,7 +99,6 @@ def parse_deepseek_response(response: Union[str, List[str]]) -> Tuple[str, str]:
     
     return letter, text_answer
 
-
 class ParsedResponse(BaseModel):
     answer: str
     letter: str
@@ -154,7 +153,8 @@ def parse_responses_batch(
     use_judge: bool = False, 
     task_config: Optional[Dict] = None,
     judge_batch_size: int = 20,
-    judge_max_workers: int = 5
+    judge_max_workers: int = 5,
+    use_mmlu: bool = False
 ) -> List[Tuple[str, str]]:
     """
     Parse multiple model responses to extract answers using batch processing.
@@ -174,7 +174,9 @@ def parse_responses_batch(
     if not responses:
         return []
     
-    if use_judge and task_config:
+    if use_judge and use_mmlu:
+        return parse_responses_with_judge_mmlu(responses, judge_batch_size, judge_max_workers)
+    elif use_judge and task_config:
         # Use judge-based parsing
         return parse_responses_with_judge_batch(
             task_config, responses, prompt_contexts, judge_batch_size, judge_max_workers
@@ -188,6 +190,76 @@ def parse_responses_batch(
         
         return [parse_response(response, thinking=thinking, prompt_context=context, use_judge=False) for response, context in zip(responses, prompt_contexts)]
 
+
+def parse_responses_with_judge_mmlu(
+    responses: List[str],
+    batch_size: int = 20,
+    max_workers: int = 5
+) -> List[Tuple[str, str]]:
+    """
+    Parse multiple model responses using an LLM judge for MMLU tasks.
+    
+    Args:
+        responses: List of raw model responses
+        batch_size: Number of requests to process concurrently
+        max_workers: Maximum number of concurrent workers
+    """
+    if not responses:
+        return []
+    
+    system_prompt = f"You are a helpful assistant. Given the following response, where the predicted answer should be at the end of the response, extract the letter of the answer (either 'A', 'B', 'C', 'D') as well as the answer following it. For example, the end of the response may have the text \"Therefore the characteristic of the ring \(2\mathbb Z\) is \(0\).\n\n**Answer: A) 0**\", so you would extract 'A' as the letter and '0' as the answer."
+    
+    def process_single_request(response: str) -> Tuple[str, str]:
+        """Process a single parsing request."""
+        client = OpenAI()
+        
+        chat = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": response}
+        ]
+        
+        try:
+            api_response = client.beta.chat.completions.parse(
+                model="gpt-4o-mini",
+                messages=chat,
+                response_format=ParsedResponse,
+            )
+            obj = json.loads(api_response.choices[0].message.content)
+            return obj['letter'], obj['answer']
+        except Exception as e:
+            # Fallback to regular parsing if judge fails
+            return "", ""
+    
+    # Process in batches using ThreadPoolExecutor for I/O-bound tasks
+    results = []
+    
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # Submit all requests
+        future_to_index = {}
+        for i in range(0, len(responses), batch_size):
+            batch_responses = responses[i:i + batch_size]
+            
+            # Submit batch of requests
+            for j, response in enumerate(batch_responses):
+                future = executor.submit(process_single_request, response)
+                future_to_index[future] = i + j
+        
+        # Collect results in order
+        index_to_result = {}
+        for future in concurrent.futures.as_completed(future_to_index):
+            index = future_to_index[future]
+            try:
+                result = future.result()
+                index_to_result[index] = result
+            except Exception as e:
+                # Fallback for failed requests
+                index_to_result[index] = "", ""
+        
+        # Sort results by original index
+        results = [index_to_result[i] for i in range(len(responses))]
+    
+    print("+++++++++++++++++Results: ", results)
+    return results
 
 def parse_responses_with_judge_batch(
     task_config: Optional[Dict], 

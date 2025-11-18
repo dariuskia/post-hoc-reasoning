@@ -34,6 +34,9 @@ class DatasetConfig:
     # Cross-dataset experiment parameters  
     train_dataset: Optional[str] = None  # If specified, use different dataset for training
     test_dataset: Optional[str] = None   # If specified, use different dataset for testing
+    
+    # Dataset-specific parameters (e.g., for MMLU: split, subject, etc.)
+    dataset_params: Optional[Dict[str, Any]] = field(default_factory=dict)
 
 
 @dataclass
@@ -114,7 +117,7 @@ class ConfigValidator:
         try:
             from data_loading import list_available_datasets
 
-            available = list_available_datasets()
+            available = list_available_datasets() + ["mmlu"]
             
             # Handle cross-dataset names like "dataset1->dataset2"
             if "->" in config.name:
@@ -266,6 +269,12 @@ class ConfigLoader:
                 configs.append(DatasetConfig(name=dataset_data))
             elif isinstance(dataset_data, dict):
                 # Dictionary format with parameters
+                # Extract known fields
+                known_fields = {"name", "train_size", "test_size", "split_seed", 
+                               "train_bias", "test_bias", "train_dataset", "test_dataset"}
+                # Everything else goes into dataset_params
+                dataset_params = {k: v for k, v in dataset_data.items() if k not in known_fields}
+                
                 configs.append(
                     DatasetConfig(
                         name=dataset_data["name"],
@@ -276,6 +285,7 @@ class ConfigLoader:
                         test_bias=dataset_data.get("test_bias"),
                         train_dataset=dataset_data.get("train_dataset"),
                         test_dataset=dataset_data.get("test_dataset"),
+                        dataset_params=dataset_params,
                     )
                 )
             else:
@@ -430,6 +440,7 @@ def create_experiment_configs(
                     train_dataset=train_dataset,
                     test_dataset=test_dataset,
                     backend=model.backend,
+                    dataset_params=dataset.dataset_params,
                 )
                 # Store steering method for later access
                 exp_config.steering_method = steering_method

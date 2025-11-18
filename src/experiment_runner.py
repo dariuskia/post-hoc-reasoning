@@ -18,7 +18,7 @@ from torch.utils.data import DataLoader, Dataset
 
 from cache_manager import ExperimentCache, ExperimentConfig, ExperimentManager
 from config import ExperimentRunConfig, create_experiment_configs
-from data_loading import load_all_datasets
+from data_loading import load_dataset
 from models import ChatModel, NNSightChatModel, TransformerLensChatModel
 from parsing_utils import parse_response, parse_responses_batch
 from utils import generate_with_steering, generate_with_ace_debiasing, _steer_generated_token
@@ -50,7 +50,7 @@ class PromptDataset(Dataset):
         if not isinstance(prompt_data, list):
             raise TypeError(f"Expected prompt to be a list of chat messages, got {type(prompt_data)}")
         
-        prompt_string = self.model.apply_chat_template(prompt_data)
+        prompt_string = self.model.apply_chat_template(prompt_data) # is prompt_data (B,C) or just (C,)
         
         return prompt_string, (
             self.data[idx]["correct_answer"],
@@ -109,8 +109,11 @@ class EnhancedExperimentRunner:
         return parse_response(response, thinking=True, prompt_context=prompt_context, 
                             use_judge=self.run_config.use_judge, task_config=None)
     
-    def parse_responses_batch(self, responses: List[str], prompt_contexts: List[str] = None) -> List[Tuple[str, str]]:
+    def parse_responses_batch(self, responses: List[str], prompt_contexts: List[str] = None, dataset_name: str = None) -> List[Tuple[str, str]]:
         """Parse multiple model responses to extract answers using batch processing."""
+        # Check if dataset is MMLU by checking if dataset_name contains "mmlu" (case-insensitive)
+        use_mmlu = dataset_name is not None and "mmlu" in dataset_name.lower()
+        
         return parse_responses_batch(
             responses, 
             thinking=True, 
@@ -118,7 +121,8 @@ class EnhancedExperimentRunner:
             use_judge=self.run_config.use_judge, 
             task_config=None,
             judge_batch_size=self.run_config.judge_batch_size,
-            judge_max_workers=self.run_config.judge_max_workers
+            judge_max_workers=self.run_config.judge_max_workers,
+            use_mmlu=use_mmlu
         )
     
     def _log_debiasing_result(
@@ -180,7 +184,7 @@ class EnhancedExperimentRunner:
             self.logger.info(f"Loading same dataset with different biases: {train_dataset_name}")
             
             # Load raw examples
-            raw_examples = create_dataset(train_dataset_name)
+            raw_examples = create_dataset(train_dataset_name, dataset_params=getattr(config, 'dataset_params', None))
             
             # Split raw examples to ensure no overlap
             train_examples, test_examples = train_test_split(
@@ -218,7 +222,8 @@ class EnhancedExperimentRunner:
                 train_dataset_name,
                 bias_type=train_bias,
                 sample_size=config.train_size,
-                model_name=config.model_name
+                model_name=config.model_name,
+                dataset_params=getattr(config, 'dataset_params', None)
             )
             train_dataset = full_train_dataset[:config.train_size]
             
@@ -227,7 +232,8 @@ class EnhancedExperimentRunner:
                 test_dataset_name,
                 bias_type=test_bias,
                 sample_size=config.test_size,
-                model_name=config.model_name
+                model_name=config.model_name,
+                dataset_params=getattr(config, 'dataset_params', None)
             )
             test_dataset = full_test_dataset[:config.test_size]
         
@@ -297,6 +303,7 @@ class EnhancedExperimentRunner:
         temperature=0.7,
         max_new_tokens=100,
         log_first_batch=False,
+        dataset_name: str = None,
     ):
         """Process a batch of prompts."""
         correct_answers, correct_letters = correct_tups
@@ -313,7 +320,7 @@ class EnhancedExperimentRunner:
 
         # Use batch parsing for better performance when judge is enabled
         if self.run_config.use_judge and len(generations) > 1:
-            responses = self.parse_responses_batch(generations, prompts)
+            responses = self.parse_responses_batch(generations, prompts, dataset_name=dataset_name)
         else:
             responses = [self.parse_response(response, prompt) for response, prompt in zip(generations, prompts)]
         pred_letters, pred_answers = zip(*responses)
@@ -362,8 +369,7 @@ class EnhancedExperimentRunner:
             if self.run_config.use_cache and cache.has_dataset(): # TODO: this is always false for some reason
                 dataset = cache.load_pickle(cache.get_dataset_path())
             else:
-                datasets = load_all_datasets(model_name=config.model_name)
-                dataset = datasets[config.dataset_name]
+                dataset = load_dataset(config.dataset_name, model_name=config.model_name, dataset_params=getattr(config, 'dataset_params', None))
                 if self.run_config.use_cache:
                     cache.save_pickle(dataset, cache.get_dataset_path())
 
@@ -450,6 +456,7 @@ class EnhancedExperimentRunner:
                     temperature=config.temperature,
                     max_new_tokens=config.max_new_tokens,
                     log_first_batch=log_first_batch,
+                    dataset_name=config.dataset_name,
                 )
             )
 
@@ -1083,7 +1090,7 @@ class EnhancedExperimentRunner:
                     
                     # Parse all debiased responses in batch
                     if self.run_config.use_judge and len(debiased_generations) > 1:
-                        batch_parsed_responses = self.parse_responses_batch(debiased_generations, prompts)
+                        batch_parsed_responses = self.parse_responses_batch(debiased_generations, prompts, dataset_name=config.dataset_name)
                         debiased_preds = [pred for _, pred in batch_parsed_responses]
                     else:
                         debiased_preds = [self.parse_response(gen, prompt)[1] for gen, prompt in zip(debiased_generations, prompts)]
@@ -1310,8 +1317,8 @@ class EnhancedExperimentRunner:
         # 1. Normalise steering_vectors to correct dtype / device
         steering_vectors = torch.as_tensor(
             steering_vectors,
-            dtype=model.W_E.dtype,
-            device=model.W_E.device,
+            dtype=torch.float32,
+            device=torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"),
         )
 
         # 2. Decide which layers to steer
@@ -1330,7 +1337,7 @@ class EnhancedExperimentRunner:
 
             # Parse all generations in batch
             if self.run_config.use_judge and len(generations) > 1:
-                batch_parsed_responses = self.parse_responses_batch(generations, prompts)
+                batch_parsed_responses = self.parse_responses_batch(generations, prompts, dataset_name=config.dataset_name)
             else:
                 batch_parsed_responses = [self.parse_response(gen, prompt) for gen, prompt in zip(generations, prompts)]
                 
@@ -1543,17 +1550,17 @@ class EnhancedExperimentRunner:
             if not self.generate_and_cache_data(model, config, cache):
                 return {"success": False, "error": "Failed to generate data"}
 
-            # Step 2: Train and cache probes
-            if not self.train_and_cache_probes(model, config, cache):
-                return {"success": False, "error": "Failed to train probes"}
+            # # Step 2: Train and cache probes
+            # if not self.train_and_cache_probes(model, config, cache):
+            #     return {"success": False, "error": "Failed to train probes"}
 
             # # Step 3: Run steering experiments
             # if not self.run_steering_experiments(model, config, cache):
             #     return {"success": False, "error": "Failed to run steering"}
 
-            # Step 4: Run debiasing experiments
-            if not self.run_debiasing_experiments(model, config, cache):
-                return {"success": False, "error": "Failed to run debiasing"}
+            # # Step 4: Run debiasing experiments
+            # if not self.run_debiasing_experiments(model, config, cache):
+            #     return {"success": False, "error": "Failed to run debiasing"}
 
             # Update status
             status = cache.get_experiment_status()

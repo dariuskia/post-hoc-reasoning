@@ -27,15 +27,24 @@ class ExperimentConfig:
     test_bias: Optional[str] = None
     train_dataset: Optional[str] = None  # For cross-dataset experiments
     test_dataset: Optional[str] = None
+    
+    # Dataset-specific parameters (e.g., for MMLU: split, subject, etc.)
+    dataset_params: Optional[Dict[str, Any]] = None
 
     def get_hash(self) -> str:
         """Generate a unique hash for this experiment configuration."""
         # Exclude steering method from hash to allow shared cache for data
         # Only include core experiment parameters that affect data generation
+        dataset_params_str = ""
+        if self.dataset_params:
+            # Sort keys for consistent hashing
+            sorted_params = sorted(self.dataset_params.items())
+            dataset_params_str = "_" + str(sorted_params)
         config_str = (
             f"{self.model_name}_{self.dataset_name}_{self.train_size}_{self.test_size}_"
             f"{self.split_seed}_{self.temperature}_{self.max_new_tokens}_"
             f"{self.train_bias}_{self.test_bias}_{self.train_dataset}_{self.test_dataset}"
+            f"{dataset_params_str}"
         )
         return hashlib.md5(config_str.encode()).hexdigest()[:12]
 
