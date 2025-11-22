@@ -1263,9 +1263,9 @@ class EnhancedExperimentRunner:
         """Generate steered examples with memory optimization."""
         # Override max_new_tokens for DeepSeek models (though they typically use nnsight)
         max_new_tokens = config.max_new_tokens
-        if hasattr(model, 'model_name') and model.model_name.lower().startswith('deepseek'):
+        if hasattr(model, 'model_name') and model.model_name.lower().startswith('deepseek') or "oss" in model.model_name.lower():
             max_new_tokens = 2000
-            self.logger.info(f"Using DeepSeek model for steering, overriding max_new_tokens to {max_new_tokens}")
+            self.logger.info(f"Using DeepSeek or GPT-OSS model for steering, overriding max_new_tokens to {max_new_tokens}")
         
         steered_results = []
         
