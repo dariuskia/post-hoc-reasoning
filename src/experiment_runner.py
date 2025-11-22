@@ -309,7 +309,7 @@ class EnhancedExperimentRunner:
         correct_answers, correct_letters = correct_tups
 
         if get_activations:
-            activations = model.batch_get_resid_activations(prompts)
+            activations = model.batch_get_resid_activations(prompts, batch_size=1)
         else:
             activations = None
         
@@ -1550,17 +1550,17 @@ class EnhancedExperimentRunner:
             if not self.generate_and_cache_data(model, config, cache):
                 return {"success": False, "error": "Failed to generate data"}
 
-            # # Step 2: Train and cache probes
-            # if not self.train_and_cache_probes(model, config, cache):
-            #     return {"success": False, "error": "Failed to train probes"}
+            # Step 2: Train and cache probes
+            if not self.train_and_cache_probes(model, config, cache):
+                return {"success": False, "error": "Failed to train probes"}
 
-            # # Step 3: Run steering experiments
-            # if not self.run_steering_experiments(model, config, cache):
-            #     return {"success": False, "error": "Failed to run steering"}
+            # Step 3: Run steering experiments
+            if not self.run_steering_experiments(model, config, cache):
+                return {"success": False, "error": "Failed to run steering"}
 
-            # # Step 4: Run debiasing experiments
-            # if not self.run_debiasing_experiments(model, config, cache):
-            #     return {"success": False, "error": "Failed to run debiasing"}
+            # Step 4: Run debiasing experiments
+            if not self.run_debiasing_experiments(model, config, cache):
+                return {"success": False, "error": "Failed to run debiasing"}
 
             # Update status
             status = cache.get_experiment_status()

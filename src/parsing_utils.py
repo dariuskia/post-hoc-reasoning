@@ -175,7 +175,7 @@ def parse_responses_batch(
         return []
     
     if use_judge and use_mmlu:
-        return parse_responses_with_judge_mmlu(responses, judge_batch_size, judge_max_workers)
+        return parse_responses_with_judge_mmlu(responses, judge_batch_size, judge_max_workers, use_concurrent=False)
     elif use_judge and task_config:
         # Use judge-based parsing
         return parse_responses_with_judge_batch(
@@ -194,7 +194,8 @@ def parse_responses_batch(
 def parse_responses_with_judge_mmlu(
     responses: List[str],
     batch_size: int = 20,
-    max_workers: int = 5
+    max_workers: int = 5,
+    use_concurrent: bool = True,
 ) -> List[Tuple[str, str]]:
     """
     Parse multiple model responses using an LLM judge for MMLU tasks.
@@ -230,35 +231,38 @@ def parse_responses_with_judge_mmlu(
             # Fallback to regular parsing if judge fails
             return "", ""
     
-    # Process in batches using ThreadPoolExecutor for I/O-bound tasks
-    results = []
-    
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        # Submit all requests
-        future_to_index = {}
-        for i in range(0, len(responses), batch_size):
-            batch_responses = responses[i:i + batch_size]
+    # Process requests either concurrently or sequentially
+    if use_concurrent:
+        # Process in batches using ThreadPoolExecutor for I/O-bound tasks
+        results = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Submit all requests
+            future_to_index = {}
+            for i in range(0, len(responses), batch_size):
+                batch_responses = responses[i:i + batch_size]
+                
+                # Submit batch of requests
+                for j, response in enumerate(batch_responses):
+                    future = executor.submit(process_single_request, response)
+                    future_to_index[future] = i + j
             
-            # Submit batch of requests
-            for j, response in enumerate(batch_responses):
-                future = executor.submit(process_single_request, response)
-                future_to_index[future] = i + j
+            # Collect results in order
+            index_to_result = {}
+            for future in concurrent.futures.as_completed(future_to_index):
+                index = future_to_index[future]
+                try:
+                    result = future.result()
+                    index_to_result[index] = result
+                except Exception as e:
+                    # Fallback for failed requests
+                    index_to_result[index] = "", ""
+            
+            # Sort results by original index
+            results = [index_to_result[i] for i in range(len(responses))]
+    else:
+        # Sequential processing, preserving order
+        results = [process_single_request(response) for response in responses]
         
-        # Collect results in order
-        index_to_result = {}
-        for future in concurrent.futures.as_completed(future_to_index):
-            index = future_to_index[future]
-            try:
-                result = future.result()
-                index_to_result[index] = result
-            except Exception as e:
-                # Fallback for failed requests
-                index_to_result[index] = "", ""
-        
-        # Sort results by original index
-        results = [index_to_result[i] for i in range(len(responses))]
-    
-    print("+++++++++++++++++Results: ", results)
     return results
 
 def parse_responses_with_judge_batch(

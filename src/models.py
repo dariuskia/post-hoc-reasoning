@@ -383,6 +383,9 @@ class NNSightChatModel(ChatModel):
             
             # Add max length truncation to prevent very long sequences
             max_length = 512  # Reasonable max length
+            # curr_length = batch_tokens.shape[1]
+            # to_pad = max(0, max_length - curr_length)
+            # batch_tokens = torch.cat([torch.ones(batch_tokens.shape[0], to_pad, dtype=batch_tokens.dtype) * self.tokenizer.pad_token_id, batch_tokens], dim=1)
             if batch_tokens.shape[1] > max_length:
                 batch_tokens = batch_tokens[:, :max_length]
             
