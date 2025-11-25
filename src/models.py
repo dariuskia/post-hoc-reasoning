@@ -382,12 +382,11 @@ class NNSightChatModel(ChatModel):
             batch_tokens = self.to_tokens(batch_prompts)
             
             # Add max length truncation to prevent very long sequences
-            max_length = 512  # Reasonable max length
+            max_length = 1024  # Reasonable max length
             # curr_length = batch_tokens.shape[1]
             # to_pad = max(0, max_length - curr_length)
-            # batch_tokens = torch.cat([torch.ones(batch_tokens.shape[0], to_pad, dtype=batch_tokens.dtype) * self.tokenizer.pad_token_id, batch_tokens], dim=1)
-            if batch_tokens.shape[1] > max_length:
-                batch_tokens = batch_tokens[:, :max_length]
+            # batch_tokens = torch.cat([torch.ones(batch_tokens.shape[0], to_pad, dtype=batch_tokens.dtype) * self.tokenizer.pad_token_id, batch_tokens[:, -max_length:]], dim=1)
+            batch_tokens = batch_tokens[:, -max_length:]
             
             # Extract activations using nnsight tracing
             with self.model.trace(batch_tokens):
@@ -444,7 +443,7 @@ class NNSightChatModel(ChatModel):
         
         return all_activations
 
-    @torch.inference_mode() 
+    @torch.no_grad() 
     def batch_get_generations(self, prompts, temperature, max_new_tokens):
         if hasattr(self.model, 'model_name') and self.model.model_name.lower().startswith('deepseek'):
             max_new_tokens = 2000
@@ -470,7 +469,7 @@ class NNSightChatModel(ChatModel):
         generations = [self.model.tokenizer.decode(o) for o in output]
         return generations
 
-    @torch.inference_mode()
+    @torch.no_grad()
     def generate_with_steering(self, prompts, temperature, max_new_tokens, alpha, steering_vectors, layers):
         steering_tensors = {}
         for layer in layers:
@@ -518,22 +517,24 @@ class NNSightChatModel(ChatModel):
             if stop_tokens:
                 gen_kwargs["eos_token_id"] = stop_tokens
 
-        instruction_pos = batch_tokens.size(1)
+        # instruction_pos = batch_tokens.size(1)
         # Generate with interventions
         with self.model.generate(batch_tokens, **gen_kwargs) as generator:
             
-            # Apply steering interventions during generation
-            for layer in layers:
-                # Get the residual stream output for this layer using architecture detection
-                residual = self._get_layer_output(layer)
-                
-                # Apply steering to all sequences in batch at the same instruction position
-                steering_vector = steering_tensors[layer].to(residual.device)
-                if steering_vector.dim() == 1:
-                    steering_vector = steering_vector.unsqueeze(0).unsqueeze(0)  # (1, 1, d_model)
-                
-                # Apply to all batch elements at once (same instruction_pos due to left-padding)
-                residual[:, instruction_pos:, :] += alpha * steering_vector.squeeze(0).squeeze(0)
+            with generator.all():
+                # Apply steering interventions during generation
+                for layer in layers:
+                    # Get the residual stream output for this layer using architecture detection
+                    residual = self._get_layer_output(layer)
+                    
+                    # Apply steering to all sequences in batch at the same instruction position
+                    steering_vector = steering_tensors[layer].to(residual.device)
+                    if steering_vector.dim() == 1:
+                        steering_vector = steering_vector.unsqueeze(0).unsqueeze(0)  # (1, 1, d_model)
+                    
+                    # Apply to all batch elements at once (same instruction_pos due to left-padding)
+                    # residual[:, instruction_pos:, :] += alpha * steering_vector.squeeze(0).squeeze(0)
+                    residual += alpha * steering_vector.squeeze(0).squeeze(0)
             
             # Get the generated output
             output = self.model.generator.output.save()

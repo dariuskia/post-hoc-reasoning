@@ -1333,7 +1333,7 @@ class EnhancedExperimentRunner:
             log_batch_progress(batch_start//batch_size + 1, (len(test_data) + batch_size - 1)//batch_size, "Steering batch")
             
             prompts = [batch['prompt'] for batch in batch_data]
-            generations = model.generate_with_steering(prompts, config.temperature, max_new_tokens, alpha, steering_vectors, layers)
+            generations = model.generate_with_steering(prompts, config.temperature, max_new_tokens, alpha, steering_vectors, layers_to_steer)
 
             # Parse all generations in batch
             if self.run_config.use_judge and len(generations) > 1:
@@ -1558,9 +1558,9 @@ class EnhancedExperimentRunner:
             if not self.run_steering_experiments(model, config, cache):
                 return {"success": False, "error": "Failed to run steering"}
 
-            # Step 4: Run debiasing experiments
-            if not self.run_debiasing_experiments(model, config, cache):
-                return {"success": False, "error": "Failed to run debiasing"}
+            # # Step 4: Run debiasing experiments
+            # if not self.run_debiasing_experiments(model, config, cache):
+            #     return {"success": False, "error": "Failed to run debiasing"}
 
             # Update status
             status = cache.get_experiment_status()
