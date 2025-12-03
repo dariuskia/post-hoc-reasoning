@@ -345,8 +345,8 @@ def create_cot_dataset(
         })
 
         # Add the assistant message unless it's a DeepSeek model
-        is_deepseek = model_name and model_name.lower().startswith('deepseek')
-        if not is_deepseek:
+        is_reasoning = model_name and (model_name.lower().startswith('deepseek') or "oss" in model_name.lower())
+        if not is_reasoning:
             prompt.append({
                 "role": "assistant",
                 "content": "A: Let's think step by step:" if thinking else "A:",

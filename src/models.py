@@ -1,6 +1,7 @@
 import os
 import platform
 import logging
+import traceback
 from typing import Dict, List, Union, Optional
 import numpy as np
 import gc
@@ -517,26 +518,11 @@ class NNSightChatModel(ChatModel):
             if stop_tokens:
                 gen_kwargs["eos_token_id"] = stop_tokens
 
-        # instruction_pos = batch_tokens.size(1)
-        # Generate with interventions
         with self.model.generate(batch_tokens, **gen_kwargs) as generator:
-            
-            with generator.all():
-                # Apply steering interventions during generation
-                for layer in layers:
-                    # Get the residual stream output for this layer using architecture detection
-                    residual = self._get_layer_output(layer)
-                    
-                    # Apply steering to all sequences in batch at the same instruction position
-                    steering_vector = steering_tensors[layer].to(residual.device)
-                    if steering_vector.dim() == 1:
-                        steering_vector = steering_vector.unsqueeze(0).unsqueeze(0)  # (1, 1, d_model)
-                    
-                    # Apply to all batch elements at once (same instruction_pos due to left-padding)
-                    # residual[:, instruction_pos:, :] += alpha * steering_vector.squeeze(0).squeeze(0)
-                    residual += alpha * steering_vector.squeeze(0).squeeze(0)
-            
-            # Get the generated output
+            # output = self.model.generator.output.save()
+            residual = self.model.model.layers[layers[0]].output
+            steering_vector = steering_tensors[layers[0]].to(residual.device)
+            residual += alpha * steering_vector
             output = self.model.generator.output.save()
         
         # Return only the freshly generated part

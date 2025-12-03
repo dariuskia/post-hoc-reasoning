@@ -2,6 +2,7 @@ import gc
 import json
 import logging
 import os
+import pickle
 import sys
 import time
 import warnings
@@ -50,7 +51,8 @@ class PromptDataset(Dataset):
         if not isinstance(prompt_data, list):
             raise TypeError(f"Expected prompt to be a list of chat messages, got {type(prompt_data)}")
         
-        prompt_string = self.model.apply_chat_template(prompt_data) # is prompt_data (B,C) or just (C,)
+        add_generation_prompt = 'gpt-oss' in self.model.model_name.lower()
+        prompt_string = self.model.apply_chat_template(prompt_data, add_generation_prompt=add_generation_prompt)
         
         return prompt_string, (
             self.data[idx]["correct_answer"],
@@ -1263,9 +1265,9 @@ class EnhancedExperimentRunner:
         """Generate steered examples with memory optimization."""
         # Override max_new_tokens for DeepSeek models (though they typically use nnsight)
         max_new_tokens = config.max_new_tokens
-        if hasattr(model, 'model_name') and model.model_name.lower().startswith('deepseek') or "oss" in model.model_name.lower():
+        if hasattr(model, 'model_name') and model.model_name.lower().startswith('deepseek'):
             max_new_tokens = 2000
-            self.logger.info(f"Using DeepSeek or GPT-OSS model for steering, overriding max_new_tokens to {max_new_tokens}")
+            self.logger.info(f"Using DeepSeek model for steering, overriding max_new_tokens to {max_new_tokens}")
         
         steered_results = []
         
@@ -1333,6 +1335,17 @@ class EnhancedExperimentRunner:
             log_batch_progress(batch_start//batch_size + 1, (len(test_data) + batch_size - 1)//batch_size, "Steering batch")
             
             prompts = [batch['prompt'] for batch in batch_data]
+            # debug_save_dir = "debug_saved"
+            # os.makedirs(debug_save_dir, exist_ok=True)
+            # with open(os.path.join(debug_save_dir, "all_args.pkl"), "wb") as f:
+            #     pickle.dump({
+            #         "prompts": prompts,
+            #         "config_temperature": config.temperature,
+            #         "max_new_tokens": max_new_tokens,
+            #         "alpha": alpha,
+            #         "steering_vectors": steering_vectors,
+            #         "layers_to_steer": layers_to_steer,
+            #     }, f)
             generations = model.generate_with_steering(prompts, config.temperature, max_new_tokens, alpha, steering_vectors, layers_to_steer)
 
             # Parse all generations in batch
@@ -1343,7 +1356,7 @@ class EnhancedExperimentRunner:
                 
             for i, (example_prompt, generation, (new_letter, new_answer)) in enumerate(zip(prompts, generations, batch_parsed_responses)):
                 global_idx = batch_start + i
-                orig = batch_data[i]["pred_answer"]
+                orig = batch_data[i]["pred_letter"]
                 
                 # Clean up generation display - handle list
                 generation_display = generation
@@ -1351,13 +1364,13 @@ class EnhancedExperimentRunner:
                     generation_display = generation[0]
                 
                 # Determine target answer based on original answer
-                target_answer = "no" if orig == "yes" else "yes"
-                is_valid_parse = new_answer in ["yes", "no"]
+                target_letter = "B" if orig == "A" else "A"
+                is_valid_parse = new_letter in ["A", "B"]
                 
                 if not is_valid_parse:
                     category = "unparsed"
                     success = False
-                elif new_answer == target_answer:
+                elif new_letter == target_letter:
                     category = "success"
                     success = True
                 else:
@@ -1379,8 +1392,8 @@ class EnhancedExperimentRunner:
                     alpha=alpha,
                     direction=direction,
                     original_answer=orig,
-                    target_answer=target_answer,
-                    steered_answer=new_answer,
+                    target_answer=target_letter,
+                    steered_answer=new_letter,
                     response_text=generation_display,
                     category=category,
                     model_name=config.model_name,
@@ -1395,7 +1408,7 @@ class EnhancedExperimentRunner:
                     "steered_generation": generation,
                     "original_answer": orig,
                     "new_answer": new_answer,
-                    "target_answer": target_answer,
+                    "target_answer": target_letter,
                     "original_letter": batch_data[i]["pred_letter"],
                     "new_letter": new_letter,
                     "alpha": alpha,
@@ -1407,15 +1420,15 @@ class EnhancedExperimentRunner:
                 
                 # Log to W&B
                 if self.wandb_logger:
-                    direction = "yes_to_no" if orig == "yes" else "no_to_yes"
+                    # direction = "yes_to_no" if orig == "yes" else "no_to_yes"
                     self.wandb_logger.log_steering_example(
                         alpha=alpha,
                         direction=direction,
                         prompt=str(example_prompt) if not isinstance(example_prompt, str) else example_prompt,
                         original_answer=orig,
                         steered_response=generation,
-                        steered_answer=new_answer,
-                        target_answer=target_answer,
+                        steered_answer=new_letter,
+                        target_answer=target_letter,
                         category=category,
                         example_idx=global_idx,
                         model_name=config.model_name,
